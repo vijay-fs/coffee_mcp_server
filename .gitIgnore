@@ -1,2 +1,9 @@
 .env
 __pycache__
+/utils/__pycache__
+/routes/__pycache__
+
+.env
+__pycache__/
+**/__pycache__/
+*.py[cod]

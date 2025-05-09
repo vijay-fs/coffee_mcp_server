@@ -63,19 +63,20 @@ class PDFHandler(FormatHandler):
             if not images:
                 raise ValueError("No images were extracted from the PDF")
 
-            # Debug: Save the first image to check conversion quality
+            # Debug: Save the first image to check conversion quality if debug path is configured
             if images:
-                debug_dir = os.path.join(
-                    os.path.dirname(__file__), "debug_images")
-                os.makedirs(debug_dir, exist_ok=True)
+                debug_path_env = os.environ.get('RAGNOR_DEBUG_IMAGES_PATH')
+                if debug_path_env:
+                    debug_dir = debug_path_env
+                    os.makedirs(debug_dir, exist_ok=True)
 
-                # Save first 2 pages for debugging
-                for i, img in enumerate(images[:2]):
-                    debug_path = os.path.join(
-                        debug_dir, f"pdf_conversion_page_{i+1}.png")
-                    img.save(debug_path)
-                    print(
-                        f"Saved PDF conversion image to {debug_path} - Size: {img.size}")
+                    # Save first 2 pages for debugging
+                    for i, img in enumerate(images[:2]):
+                        debug_path = os.path.join(
+                            debug_dir, f"pdf_conversion_page_{i+1}.png")
+                        img.save(debug_path)
+                        print(
+                            f"Saved PDF conversion image to {debug_path} - Size: {img.size}")
 
             return images
 
