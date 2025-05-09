@@ -46,6 +46,53 @@ class RagnorDocumentProcessor:
                 f"Warning: Could not initialize embedding generator for {embedding_provider}. Embeddings will not be generated.")
             self.embedding_generator = None
         self.background_tasks = {}  # Keep track of background tasks
+        
+    def generate_embeddings_for_text(self, text: str, provider: str = "openai"):
+        """Generate embeddings for the given text using the specified provider.
+        
+        Args:
+            text: The text to generate embeddings for
+            provider: The embedding provider to use (default: "openai")
+            
+        Returns:
+            Tuple containing (embeddings, model_name, success_flag)
+        """
+        if not text or not text.strip():
+            print("WARNING: Cannot generate embeddings for empty text")
+            return [], "", False
+            
+        try:
+            from utils.ragnor_embedding_generator import OpenAIEmbeddingGenerator
+            print(f"Generating embeddings for text using {provider}")
+            
+            # Create embedding generator based on provider
+            if provider.lower() == "openai":
+                embedding_generator = OpenAIEmbeddingGenerator()
+                embedding_model = embedding_generator.model
+            else:
+                print(f"Unsupported embedding provider: {provider}, defaulting to OpenAI")
+                embedding_generator = OpenAIEmbeddingGenerator()
+                embedding_model = embedding_generator.model
+            
+            # Generate embeddings for the text
+            embeddings = embedding_generator.generate_embeddings(text)
+            
+            # Ensure the embeddings are properly formatted for MongoDB
+            # Convert numpy arrays or any other non-JSON serializable formats to lists of floats
+            if embeddings is not None:
+                # Ensure we have valid numeric values
+                processed_embeddings = [float(val) for val in embeddings]
+                print(f"Generated embeddings with {len(processed_embeddings)} dimensions")
+                # Print a sample of the first few embeddings to verify format
+                print(f"Sample embeddings (first 3): {processed_embeddings[:3]}")
+                return processed_embeddings, embedding_model, True
+            else:
+                print("WARNING: No embeddings were generated")
+                return [], embedding_model, False
+        except Exception as emb_err:
+            print(f"ERROR generating embeddings: {str(emb_err)}")
+            print(f"Stack trace: {traceback.format_exc()}")
+            return [], "", False
 
     async def create_extraction_job(self, file_content: bytes, filename: str, mime_type: str) -> str:
         """Create a new document extraction job and return the job ID."""
@@ -144,7 +191,32 @@ class RagnorDocumentProcessor:
         except Exception as e:
             print(f"Error updating job status: {str(e)}")
 
-    def _process_single_page_sync(self, image, page_num, total_pages, file_format, extraction_id, job_id):
+    async def update_job_metadata(self, job_id: str, metadata: dict) -> None:
+        """Update metadata for a document extraction job.
+        
+        Args:
+            job_id: The ID of the job to update
+            metadata: A dictionary of metadata to update
+        """
+        try:
+            # Update the job document with the provided metadata
+            update_doc = {
+                **metadata,
+                "updatedAt": datetime.utcnow()
+            }
+            
+            # Update job document
+            result = ragnor_doc_jobs_collection.update_one(
+                {"_id": job_id},
+                {"$set": update_doc}
+            )
+            
+            print(f"Updated job metadata for {job_id}: {metadata}, modified count: {result.modified_count}")
+            
+        except Exception as e:
+            print(f"Error updating job metadata: {str(e)}")
+
+    def _process_single_page_sync(self, image, page_num, total_pages, file_format, extraction_id, job_id, generate_embeddings=False, embedding_provider="openai"):
         """Process a single page with OCR and update the database (synchronous version).
 
         This is a non-async version of the method for use in background threads.
@@ -170,7 +242,7 @@ class RagnorDocumentProcessor:
             print(f"OCR result for page {page_num}: {text_sample}")
             print(f"Extracted {len(ocr_result.text_lines)} text lines")
 
-            # Create page data with proper structure
+            # Create text chunks for the page data
             text_chunks = []
             if ocr_result.text_lines:
                 for line in ocr_result.text_lines:
@@ -184,18 +256,44 @@ class RagnorDocumentProcessor:
                             "height": line.bbox[3] if line.bbox else 0
                         }
                     })
-
+            
+            # Start with basic page data structure
             page_data = {
-                "pageNumber": page_num,
-                "text": full_text,
-                "textChunks": text_chunks,
-                "hasTable": False,  # Placeholder, table detection not implemented yet
-                "tables": []
+                "pageNumber": page_num
             }
+            
+            # Add text content (this will be first in the document)
+            page_data["text"] = full_text
+            
+            # Generate embeddings immediately after OCR is complete if requested
+            if generate_embeddings and full_text.strip():
+                print(f"Generating embeddings for page {page_num} text using {embedding_provider}")
+                embeddings, embedding_model, success = self.generate_embeddings_for_text(full_text, embedding_provider)
+                
+                if success and embeddings:
+                    # Add embeddings right after text in the page data
+                    print(f"DEBUG: Adding embeddings to page {page_num} data")
+                    page_data["embeddings"] = embeddings
+                    page_data["embeddingModel"] = embedding_model
+                    page_data["hasEmbeddings"] = True
+                    # Print the type and a sample to verify
+                    print(f"DEBUG: Embeddings type: {type(embeddings)}, length: {len(embeddings)}")
+                    print(f"DEBUG: First few values: {embeddings[:3]}")
+                else:
+                    # Continue without embeddings
+                    print(f"DEBUG: No valid embeddings generated for page {page_num}")
+                    page_data["hasEmbeddings"] = False
+            else:
+                print(f"DEBUG: Embeddings not requested for page {page_num}")
+                page_data["hasEmbeddings"] = False
+            
+            # Add the remaining page data AFTER text and embeddings
+            page_data["textChunks"] = text_chunks
+            page_data["hasTable"] = False  # Placeholder, table detection not implemented yet
+            page_data["tables"] = []
 
-            print(
-                f"Created page data for page {page_num} with {len(text_chunks)} text chunks")
-
+            print(f"Created page data for page {page_num} with {len(text_chunks)} text chunks")
+            
             # Check if extraction document exists before updating
             existing_doc = ragnor_doc_extractions_collection.find_one({"_id": extraction_id})
             if not existing_doc:
@@ -214,47 +312,122 @@ class RagnorDocumentProcessor:
 
             # Update the extraction document in the database with this page's data
             try:
-                # Use $addToSet for processedPages to avoid duplicates
+                # First, verify the page data structure has embeddings in the right position if requested
+                if generate_embeddings and full_text.strip():
+                    print(f"DEBUG: Generating embeddings for MongoDB update")
+                    # Generate embeddings right before MongoDB update
+                    embeddings, embedding_model, success = self.generate_embeddings_for_text(full_text, embedding_provider)
+                    
+                    if success and embeddings:
+                        print(f"DEBUG: Successfully generated {len(embeddings)} embeddings")
+                        
+                        # Force a new ordered document with embeddings
+                        ordered_page_data = {
+                            "pageNumber": page_num,
+                            "text": full_text,
+                            "embeddings": embeddings,  # Force embeddings here
+                            "embeddingModel": embedding_model,
+                            "hasEmbeddings": True,
+                            "textChunks": page_data["textChunks"],
+                            "hasTable": False,
+                            "tables": []
+                        }
+                        page_data = ordered_page_data
+                        print(f"DEBUG: Created ordered page data with embeddings in position 3")
+                        print(f"DEBUG: Keys in order: {list(page_data.keys())}")
+                    else:
+                        print(f"ERROR: Failed to generate embeddings before MongoDB update")
+                    
+                # Use direct MongoDB operations to ensure embeddings are included
+                print(f"DEBUG: Using direct MongoDB operations to store embeddings")
+                
+                # First, remove any existing page
+                remove_result = ragnor_doc_extractions_collection.update_one(
+                    {"_id": extraction_id},
+                    {"$pull": {"pageContents": {"pageNumber": page_num}}}
+                )
+                print(f"DEBUG: Removed existing page data, matched count: {remove_result.matched_count}")
+                
+                # Mark page as processed in the tracking list
+                ragnor_doc_extractions_collection.update_one(
+                    {"_id": extraction_id},
+                    {"$addToSet": {"processedPages": page_num}}
+                )
+                
+                # Get current document to check structure
+                current_doc = ragnor_doc_extractions_collection.find_one({"_id": extraction_id})
+                if not current_doc:
+                    print(f"ERROR: Document {extraction_id} not found in database")
+                    return False
+                
+                # Force embeddings generation if it was requested in the API call
+                job_doc = ragnor_doc_jobs_collection.find_one({"_id": job_id})
+                should_generate_embeddings = job_doc.get("embedding", False) if job_doc else generate_embeddings
+                
+                if should_generate_embeddings and full_text.strip():
+                    print(f"FORCING EMBEDDINGS GENERATION for page {page_num} based on job settings")
+                    embeddings, embedding_model, success = self.generate_embeddings_for_text(full_text, embedding_provider)
+                    
+                    if success and embeddings:
+                        print(f"SUCCESS: Generated {len(embeddings)} embeddings for forced storage")
+                        has_embeddings = True
+                    else:
+                        print(f"ERROR: Failed to generate embeddings even with forced approach")
+                        embeddings = []
+                        embedding_model = "openai"
+                        has_embeddings = False
+                else:
+                    print(f"No embeddings requested at job level for page {page_num}")
+                    embeddings = []
+                    embedding_model = ""
+                    has_embeddings = False
+                
+                # Construct page document with explicit field order to ensure embeddings are right after text
+                ordered_page_content = {
+                    "pageNumber": page_num,
+                    "text": full_text,
+                    "embeddings": embeddings,
+                    "embeddingModel": embedding_model, 
+                    "hasEmbeddings": has_embeddings,
+                    "textChunks": page_data["textChunks"],
+                    "hasTable": False,
+                    "tables": []
+                }
+                
+                # Use direct $push with properly ordered fields
                 update_result = ragnor_doc_extractions_collection.update_one(
                     {"_id": extraction_id},
                     {
-                        "$addToSet": {
-                            "processedPages": page_num
-                        },
                         "$push": {
-                            "pageContents": page_data
+                            "pageContents": ordered_page_content
                         },
-                        "$set": {
-                            "updatedAt": datetime.utcnow()
-                        }
+                        "$set": {"updatedAt": datetime.utcnow()}
                     }
                 )
                 print(f"Updated extraction document with page {page_num} data, modified: {update_result.modified_count}")
                 
-                # Double check if the update succeeded
+                # Verify the update succeeded
                 if update_result.modified_count == 0:
-                    print(f"WARNING: Failed to update extraction document {extraction_id}, trying alternate approach")
-                    # Try an alternative approach - first pull any existing entry for this page, then push the new one
-                    update_result = ragnor_doc_extractions_collection.update_one(
-                        {"_id": extraction_id},
-                        {
-                            "$pull": {
-                                "pageContents": {"pageNumber": page_num}
-                            }
-                        }
-                    )
-                    update_result = ragnor_doc_extractions_collection.update_one(
-                        {"_id": extraction_id},
-                        {
-                            "$push": {
-                                "pageContents": page_data
-                            },
-                            "$set": {
-                                "updatedAt": datetime.utcnow()
-                            }
-                        }
-                    )
-                    print(f"Alternative update approach result: {update_result.modified_count}")
+                    print(f"WARNING: Failed to update extraction document {extraction_id}, verifying its existence")
+                    # Check if the extraction document exists
+                    doc_exists = ragnor_doc_extractions_collection.find_one({"_id": extraction_id})
+                    if not doc_exists:
+                        print(f"ERROR: Extraction document {extraction_id} does not exist!")
+                    else:
+                        print(f"INFO: Extraction document exists, but update failed. Forcing update.")
+                        
+                # As a final check, verify the data was stored correctly
+                verification = ragnor_doc_extractions_collection.find_one(
+                    {"_id": extraction_id, "pageContents.pageNumber": page_num},
+                    {"pageContents.$": 1}
+                )
+                if verification and "pageContents" in verification and len(verification["pageContents"]) > 0:
+                    stored_page = verification["pageContents"][0]
+                    print(f"DEBUG: Verified page {page_num} storage. hasEmbeddings={stored_page.get('hasEmbeddings', False)}")
+                    if generate_embeddings and not stored_page.get('hasEmbeddings', False):
+                        print(f"WARNING: Embeddings were not properly stored for page {page_num}!")
+                else:
+                    print(f"WARNING: Could not verify page {page_num} data was properly stored")
                 
                 return True
             except Exception as update_err:
@@ -367,7 +540,7 @@ class RagnorDocumentProcessor:
                 f"Continuing with next page despite OCR error on page {page_num}")
             return False
 
-    def _process_document_in_background(self, job_id: str, file_content: bytes, retry_count: int = 0):
+    def _process_document_in_background(self, job_id: str, file_content: bytes, retry_count: int = 0, embedding: bool = False, embedding_provider: str = "openai"):
         """Process a document in a background thread (non-async version).
         This keeps the API responsive during intensive processing.
         """
@@ -397,7 +570,7 @@ class RagnorDocumentProcessor:
             print(f"Using format handler: {handler.__class__.__name__}")
 
             self._process_document_impl(
-                job_id, file_content, file_format, filename, handler, retry_count)
+                job_id, file_content, file_format, filename, handler, retry_count, embedding, embedding_provider)
 
         except Exception as e:
             # Log and update job status if there's an error
@@ -443,7 +616,7 @@ class RagnorDocumentProcessor:
         except Exception as e:
             print(f"Error updating job status: {str(e)}")
 
-    async def process_document(self, job_id: str, file_content: bytes, retry_count: int = 0) -> None:
+    async def process_document(self, job_id: str, file_content: bytes, retry_count: int = 0, embedding: bool = False, embedding_provider: str = "openai") -> None:
         """Process a document extraction job with retry mechanism.
         This method starts a background process and returns immediately to keep the API responsive.
 
@@ -451,6 +624,8 @@ class RagnorDocumentProcessor:
             job_id (str): The ID of the job to process
             file_content (bytes): The document file content
             retry_count (int): The current retry count
+            embedding (bool): Whether to generate embeddings for extracted text
+            embedding_provider (str): The provider to use for generating embeddings
         """
         MAX_RETRIES = 3
 
@@ -461,7 +636,7 @@ class RagnorDocumentProcessor:
         # Start processing in a background thread to keep API responsive
         process_thread = threading.Thread(
             target=self._process_document_in_background,
-            args=(job_id, file_content, retry_count)
+            args=(job_id, file_content, retry_count, embedding, embedding_provider)
         )
         process_thread.daemon = True  # Thread will exit when main thread exits
         process_thread.start()
@@ -471,9 +646,19 @@ class RagnorDocumentProcessor:
 
         print(f"Document processing started in background for job {job_id}")
 
-    def _process_document_impl(self, job_id: str, file_content: bytes, file_format: str, filename: str, handler, retry_count: int = 0):
+    def _process_document_impl(self, job_id: str, file_content: bytes, file_format: str, filename: str, handler, retry_count: int = 0, embedding: bool = False, embedding_provider: str = "openai"):
         """Implementation of document processing that runs in the background thread.
         This is a non-async version that runs in a background thread.
+        
+        Args:
+            job_id: The ID of the job to process
+            file_content: The document file content
+            file_format: The format of the document
+            filename: The name of the file
+            handler: The format handler to use
+            retry_count: The current retry count
+            embedding: Whether to generate embeddings for extracted text
+            embedding_provider: The provider to use for generating embeddings
         """
         MAX_RETRIES = 3
 
@@ -567,9 +752,10 @@ class RagnorDocumentProcessor:
                         image = PDFHandler.convert_page_to_image(
                             file_content, page_num, total_pages)
 
-                        # Immediately process this page with OCR
+                        # Immediately process this page with OCR and generate embeddings if requested
                         self._process_single_page_sync(
-                            image, page_num, total_pages, file_format, extraction_id, job_id)
+                            image, page_num, total_pages, file_format, extraction_id, job_id,
+                            generate_embeddings=embedding, embedding_provider=embedding_provider)
                         processed_pages.append(page_num)
 
                         # Update progress - scale from 10% to 90% based on page completion
@@ -1067,17 +1253,29 @@ class RagnorDocumentProcessor:
 
             # Add page contents
             for page_content in extraction_doc.get("pageContents", []):
+                # Include embeddings if they exist in the document
+                has_embeddings = page_content.get("hasEmbeddings", False)
+                
                 page = {
                     "pageNumber": page_content.get("pageNumber"),
                     "text": page_content.get("text"),
+                    "hasEmbeddings": has_embeddings,
                     "textChunks": page_content.get("textChunks", []),
                     "hasTable": page_content.get("hasTable", False),
                     "tables": page_content.get("tables", [])
                 }
+                
+                # Add embeddings and model if they exist
+                if has_embeddings:
+                    # Include embeddings and model information
+                    page["embeddings"] = page_content.get("embeddings", [])
+                    page["embeddingModel"] = page_content.get("embeddingModel", "")
+                    print(f"Including embeddings for page {page_content.get('pageNumber')} in API response")
+                
                 response["pages"].append(page)
 
             return response
-
+            
         except Exception as e:
             print(f"Error getting extraction result: {str(e)}")
             raise

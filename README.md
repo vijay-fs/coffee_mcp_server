@@ -357,6 +357,13 @@ Run tests with:
 pytest
 ```
 
+## Suggested Folder Structure and Naming Conventions for Coffee MCP Server
+
+Link to the folder structure and naming conventions document:
+[docs/folder_structure_and_naming_conventions.md](docs/folder_structure_and_naming_conventions.md)
+
+!NOTE: The folder structure and naming conventions document is a work in progress and is subject to change.
+
 ## 📄 License
 
 [Include your license information here]
