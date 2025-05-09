@@ -7,12 +7,15 @@ A powerful document extraction and processing API server built with FastAPI, des
 Coffee MCP Server provides a robust API for processing documents (PDFs, images, etc.) and extracting their content with advanced OCR and text processing capabilities. The server handles documents asynchronously, making it suitable for processing large files without blocking the client.
 
 Key features include:
-- Asynchronous document processing
-- Text extraction using OCR
+
+- Asynchronous document processing with responsive API during long-running tasks
+- Page-by-page PDF processing for real-time status updates
+- Text extraction using OCR (Optical Character Recognition)
 - Table detection and extraction
 - Generation of text embeddings (using OpenAI or other providers)
 - MongoDB storage for persistent job tracking and results
 - RESTful API with comprehensive endpoints
+- Background thread processing to maintain API responsiveness
 
 ## 🚀 Setup Guide
 
@@ -28,6 +31,7 @@ Key features include:
 ### Installation
 
 1. **Clone the repository**
+
    ```bash
    git clone <repository-url>
    cd coffee_mcp_server
@@ -46,6 +50,7 @@ Key features include:
    ```
 
    Key dependencies include:
+
    - FastAPI and Uvicorn for the API server
    - PyMongo for MongoDB interaction
    - OpenAI and Anthropic for embeddings generation
@@ -54,19 +59,20 @@ Key features include:
    - Various utilities for handling different file formats
 
 3. **Environment Configuration**
-   
+
    Create a `.env` file in the project root with the following variables:
+
    ```
    # MongoDB Connection
    MONGODB_URI=mongodb://localhost:27017
    MONGODB_DATABASE=coffee_mcp
-   
+
    # API Keys
    OPENAI_API_KEY=your_openai_api_key
-   
+
    # Optional: Other embedding providers
    # ANTHROPIC_API_KEY=your_anthropic_api_key
-   
+
    # Server Configuration
    PORT=8000
    HOST=localhost
@@ -76,8 +82,9 @@ Key features include:
    > Use `.env.example` as a template without actual secrets.
 
 4. **Start MongoDB**
-   
+
    Ensure your MongoDB instance is running:
+
    ```bash
    mongod --dbpath /path/to/data/directory
    ```
@@ -96,12 +103,14 @@ Key features include:
 Submit a document for extraction.
 
 **Request:**
+
 - Content-Type: `multipart/form-data`
 - Body:
   - `file`: The document file to process (Required)
   - `embedding_provider`: The provider to use for generating embeddings (Default: "openai")
 
 **Response:**
+
 ```json
 {
   "job_id": "65a1f2d3b4c5d6e7f8g9h0i1",
@@ -111,6 +120,7 @@ Submit a document for extraction.
 ```
 
 **Processing Flow:**
+
 1. The document is uploaded and a job is created
 2. Document processing happens asynchronously in the background
 3. The client receives a job ID that can be used to check the status
@@ -122,10 +132,12 @@ Submit a document for extraction.
 Get the status of a document extraction job.
 
 **Request:**
+
 - Query Parameters:
   - `job_id`: The ID of the job to check (Required)
 
 **Response:**
+
 ```json
 {
   "job_id": "65a1f2d3b4c5d6e7f8g9h0i1",
@@ -138,6 +150,7 @@ Get the status of a document extraction job.
 ```
 
 **Possible Status Values:**
+
 - `pending`: Job is queued but not yet started
 - `processing`: Job is actively being processed
 - `completed`: Job has completed successfully
@@ -148,12 +161,14 @@ Get the status of a document extraction job.
 Get the result of a completed document extraction job.
 
 **Request:**
+
 - Query Parameters:
   - `job_id`: The ID of the job to get results for (Required)
   - `page`: Page number for pagination (Optional)
   - `page_size`: Number of pages to return per request (Optional, default: 10)
 
 **Response:**
+
 ```json
 {
   "job_id": "65a1f2d3b4c5d6e7f8g9h0i1",
@@ -248,16 +263,20 @@ The server is built around several key components:
 ```
 
 1. **Document Upload**:
+
    - Client uploads document to `/v1/extract_data`
    - Server creates a job entry in MongoDB
    - Background task is triggered for processing
 
-2. **Background Processing**:
+2. **Optimized Background Processing**:
+
    - Document is analyzed and format detected
-   - Text extraction is performed using OCR if needed
-   - Tables are detected and extracted if present
-   - Text chunks are processed and embeddings generated
-   - Progress is continuously updated in MongoDB
+   - For large PDFs (>10 pages), processing happens page-by-page in real-time
+   - Each page is converted to an image and immediately processed with OCR
+   - MongoDB is updated after each page is processed, enabling real-time progress tracking
+   - Background thread processing ensures API remains responsive during intensive OCR tasks
+   - Progress percentage is continuously updated in MongoDB
+   - For smaller documents, batch processing is used for efficiency
 
 3. **Result Retrieval**:
    - Client polls `/v1/extract_data_job` for status
@@ -275,7 +294,6 @@ The server is built around several key components:
     1. Remove sensitive data from Git history using `git filter-branch`
     2. Update all compromised API keys immediately
     3. Ensure `.gitignore` is properly configured
-  
 - **Input Validation**: All inputs are validated to prevent injection attacks
 - **Error Handling**: Robust error handling prevents exposing sensitive details
 - **CORS Configuration**: API is configured with appropriate CORS settings
@@ -283,6 +301,42 @@ The server is built around several key components:
   - Use feature branches for development
   - Review code for security issues before merging
   - Regularly update dependencies to patch security vulnerabilities
+
+## 🔧 Performance Optimizations
+
+### Responsive PDF Processing
+
+The server implements several optimizations to ensure responsiveness when processing large PDF documents:
+
+1. **Page-by-Page Processing**:
+
+   - Large PDFs are processed one page at a time
+   - Each page is immediately processed after conversion instead of waiting for all pages to be converted
+   - MongoDB is updated after each page completes, providing real-time status updates
+
+2. **Background Thread Processing**:
+
+   - Document processing runs in a background thread
+   - Main API thread remains responsive for status queries and other requests
+   - Non-blocking architecture allows for concurrent processing of multiple documents
+
+3. **Optimized MongoDB Interaction**:
+
+   - Support for both string IDs and ObjectIds in queries
+   - Efficient update operations with minimal database overhead
+   - Atomic updates for page data to prevent race conditions
+   - Robust error handling with automatic recovery mechanisms
+
+4. **Flexible Debug Image Handling**:
+   - Debug images can be saved to a configurable path using `RAGNOR_DEBUG_IMAGES_PATH` environment variable
+   - If the variable is not set, no debug images are created, improving performance
+
+### Memory and Performance Considerations
+
+- Processing large documents (500+ pages) requires sufficient memory for OCR operations
+- For very large documents, consider increasing server memory allocation
+- API remains responsive even during intensive processing tasks
+- Progress updates allow clients to accurately track status of long-running jobs
 
 ## 🧩 Development and Extensions
 
@@ -298,6 +352,7 @@ To add a new feature to the Coffee MCP Server:
 ### Testing
 
 Run tests with:
+
 ```bash
 pytest
 ```
@@ -309,3 +364,7 @@ pytest
 ## 👥 Contributors
 
 [List of contributors]
+
+## Author
+
+Vijay
