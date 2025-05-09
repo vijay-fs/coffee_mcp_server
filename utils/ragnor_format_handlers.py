@@ -41,11 +41,66 @@ class PDFHandler(FormatHandler):
     """Handler for PDF documents."""
 
     @staticmethod
+    def get_pdf_page_count(file_content: bytes) -> int:
+        """Get the total number of pages in a PDF without loading them all."""
+        try:
+            # Import here to avoid circular imports
+            from PyPDF2 import PdfReader
+            pdf_file = io.BytesIO(file_content)
+            pdf_reader = PdfReader(pdf_file)
+            total_pages = len(pdf_reader.pages)
+            print(f"PDF has {total_pages} pages in total")
+            return total_pages
+        except Exception as e:
+            print(f"Error reading PDF page count: {str(e)}")
+            return 0
+            
+    @staticmethod
     def convert_to_images(file_content: bytes, file_format: str) -> List[Image.Image]:
-        """Convert PDF to list of PIL images."""
+        """Convert PDF to list of PIL images.
+        
+        For large PDFs, this method will return a list with only the first page image,
+        and the caller should use convert_page_to_image to get additional pages.
+        """
         try:
             print(f"Converting PDF to images with high resolution (DPI=300)")
-            # Use higher DPI for better OCR results
+            
+            # Get total number of pages without loading them all at once
+            total_pages = PDFHandler.get_pdf_page_count(file_content)
+            
+            # For large PDFs, just convert the first page and return it
+            # The caller should use convert_page_to_image for additional pages
+            if total_pages > 10:  # Only convert first page for large PDFs
+                print(f"Large PDF detected with {total_pages} pages - returning only first page")
+                page_images = convert_from_bytes(
+                    file_content,
+                    dpi=300,  # Higher DPI for better OCR results
+                    fmt='png',
+                    thread_count=2,
+                    use_cropbox=True,
+                    strict=False,
+                    transparent=False,
+                    grayscale=True,
+                    first_page=1,
+                    last_page=1
+                )
+                
+                # Debug: Save first page image for debugging if debug path is configured
+                if page_images and len(page_images) > 0:
+                    debug_path_env = os.environ.get('RAGNOR_DEBUG_IMAGES_PATH')
+                    if debug_path_env:
+                        debug_dir = debug_path_env
+                        os.makedirs(debug_dir, exist_ok=True)
+                        debug_path = os.path.join(debug_dir, "pdf_conversion_page_1.png")
+                        page_images[0].save(debug_path)
+                        print(f"Saved PDF conversion image to {debug_path} - Size: {page_images[0].size}")
+                    
+                    print(f"Successfully converted PDF page 1/{total_pages}")
+                    return page_images
+                else:
+                    raise ValueError("Failed to convert first page of PDF")
+            
+            # For smaller PDFs, convert all pages at once (original behavior)
             images = convert_from_bytes(
                 file_content,
                 dpi=300,  # Higher DPI for better OCR results
@@ -54,35 +109,68 @@ class PDFHandler(FormatHandler):
                 use_cropbox=True,
                 strict=False,
                 transparent=False,
-                grayscale=False  # Keep color for better OCR in some cases
+                grayscale=True  # Keep color for better OCR in some cases
             )
-
-            print(f"Successfully converted PDF to {len(images)} images")
 
             # Verify images were created successfully
             if not images:
                 raise ValueError("No images were extracted from the PDF")
 
-            # Debug: Save the first image to check conversion quality if debug path is configured
+            # Debug: Save the first image for debugging if debug path is configured
             if images:
                 debug_path_env = os.environ.get('RAGNOR_DEBUG_IMAGES_PATH')
                 if debug_path_env:
                     debug_dir = debug_path_env
                     os.makedirs(debug_dir, exist_ok=True)
-
                     # Save first 2 pages for debugging
                     for i, img in enumerate(images[:2]):
-                        debug_path = os.path.join(
-                            debug_dir, f"pdf_conversion_page_{i+1}.png")
+                        debug_path = os.path.join(debug_dir, f"pdf_conversion_page_{i+1}.png")
                         img.save(debug_path)
-                        print(
-                            f"Saved PDF conversion image to {debug_path} - Size: {img.size}")
-
+                        print(f"Saved PDF conversion image to {debug_path} - Size: {img.size}")
+            
+            print(f"Successfully converted PDF to {len(images)} images in total")
             return images
 
         except Exception as e:
             print(f"Error converting PDF to images: {str(e)}")
             raise ValueError(f"Failed to convert PDF to images: {str(e)}")
+    
+    @staticmethod
+    def convert_page_to_image(file_content: bytes, page_num: int, total_pages: int) -> Image.Image:
+        """Convert a specific PDF page to an image."""
+        try:
+            print(f"Converting PDF page {page_num}/{total_pages} to image")
+            page_images = convert_from_bytes(
+                file_content,
+                dpi=300,  # Higher DPI for better OCR results
+                fmt='png',
+                thread_count=2,
+                use_cropbox=True,
+                strict=False,
+                transparent=False,
+                grayscale=True,
+                first_page=page_num,
+                last_page=page_num
+            )
+            
+            if not page_images or len(page_images) == 0:
+                raise ValueError(f"Failed to convert page {page_num}")
+                
+            # Debug: Save image for debugging if path is configured
+            if page_num <= 2:  # Only save first 2 pages for debugging
+                debug_path_env = os.environ.get('RAGNOR_DEBUG_IMAGES_PATH')
+                if debug_path_env:
+                    debug_dir = debug_path_env
+                    os.makedirs(debug_dir, exist_ok=True)
+                    debug_path = os.path.join(debug_dir, f"pdf_conversion_page_{page_num}.png")
+                    page_images[0].save(debug_path)
+                    print(f"Saved PDF conversion image to {debug_path} - Size: {page_images[0].size}")
+            
+            print(f"Successfully converted PDF page {page_num}/{total_pages} to image")
+            return page_images[0]
+        except Exception as e:
+            print(f"Error converting PDF page {page_num}: {str(e)}")
+            raise ValueError(f"Failed to convert PDF page {page_num}: {str(e)}")
 
     @staticmethod
     def extract_metadata(file_content: bytes, file_format: str) -> Dict[str, Any]:
