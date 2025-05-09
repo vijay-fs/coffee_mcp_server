@@ -22,16 +22,16 @@ document_processor = RagnorDocumentProcessor()
 # Background task for processing documents
 
 
-async def process_document_task(job_id: str, file_content: bytes):
+async def process_document_task(job_id: str, file_content: bytes, embedding: bool = False, embedding_provider: str = "openai"):
     """Background task for processing a document."""
     print(
-        f"Starting background processing for job {job_id}, file size: {len(file_content)} bytes")
+        f"Starting background processing for job {job_id}, file size: {len(file_content)} bytes, embedding={embedding}")
     try:
         # Delay processing a bit to ensure job creation has completed
         await asyncio.sleep(1)
 
         # Perform the actual document processing
-        await document_processor.process_document(job_id, file_content)
+        await document_processor.process_document(job_id, file_content, embedding=embedding, embedding_provider=embedding_provider)
 
         print(f"Document processing completed successfully for job {job_id}")
     except Exception as e:
@@ -70,6 +70,7 @@ async def extract_data(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     embedding_provider: str = Form("openai"),
+    embedding: bool = Form(False),
 ):
     """
     Submit a document for extraction.
@@ -143,8 +144,11 @@ async def extract_data(
         # Clean up the temporary file
         os.unlink(temp_path)
 
-        # Add document processing to background tasks
-        background_tasks.add_task(process_document_task, job_id, file_content)
+        # Add document processing to background tasks with explicit embedding parameters
+        print(f"API Request: embedding={embedding}, provider={embedding_provider}")
+        # Store embedding flag in job document for reference
+        await document_processor.update_job_metadata(job_id, {"embedding": embedding, "embedding_provider": embedding_provider})
+        background_tasks.add_task(process_document_task, job_id, file_content, embedding, embedding_provider)
 
         # Return job ID and initial status
         return {
