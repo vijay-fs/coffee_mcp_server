@@ -2,22 +2,34 @@
 Core document processing logic for Ragnor document extraction API.
 """
 import os
+import sys
 import io
+import json
 import time
-import random
 import asyncio
-from typing import Dict, Any
-from bson import ObjectId
+import random
+import traceback
+import threading
+import multiprocessing
+from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
+from bson import ObjectId
+
+import pytesseract
+from PIL import Image
 
 from db.ragnor_db_models import JobStatus, RagnorDocJob, RagnorDocExtraction, PageContent, TextChunk
 from db.db import ragnor_doc_jobs_collection, ragnor_doc_extractions_collection
-from utils.ragnor_format_handlers import get_handler_for_format, FormatHandler
+from utils.ragnor_format_handlers import get_handler_for_format, FormatHandler, PDFHandler
 from utils.ragnor_text_extractor import RagnorTextExtractor, OCRResult
 from utils.ragnor_embedding_generator import get_embedding_generator
 
 # Initialize the text extractor
 text_extractor = RagnorTextExtractor()
+
+# Create a process pool for OCR processing
+# This will allow the API to remain responsive during heavy processing
+OCR_PROCESS_POOL = multiprocessing.Pool(processes=2)
 
 
 class RagnorDocumentProcessor:
@@ -33,6 +45,7 @@ class RagnorDocumentProcessor:
             print(
                 f"Warning: Could not initialize embedding generator for {embedding_provider}. Embeddings will not be generated.")
             self.embedding_generator = None
+        self.background_tasks = {}  # Keep track of background tasks
 
     async def create_extraction_job(self, file_content: bytes, filename: str, mime_type: str) -> str:
         """Create a new document extraction job and return the job ID."""
@@ -67,8 +80,19 @@ class RagnorDocumentProcessor:
     async def get_job_status(self, job_id: str) -> Dict[str, Any]:
         """Get the status of a document extraction job."""
         try:
-            # Find the job document
+            # Find the job document - try both string ID and ObjectId 
             job_doc = ragnor_doc_jobs_collection.find_one({"_id": job_id})
+            
+            # If not found with string ID, try with ObjectId
+            if not job_doc:
+                try:
+                    # Try to convert to ObjectId and search again
+                    from bson.objectid import ObjectId
+                    job_doc = ragnor_doc_jobs_collection.find_one({"_id": ObjectId(job_id)})
+                    print(f"Found job with ObjectId: {job_id}")
+                except:
+                    # If conversion fails, it's not a valid ObjectId
+                    print(f"Could not convert {job_id} to ObjectId")
 
             if not job_doc:
                 raise ValueError(f"Job not found: {job_id}")
@@ -120,38 +144,242 @@ class RagnorDocumentProcessor:
         except Exception as e:
             print(f"Error updating job status: {str(e)}")
 
-    async def process_document(self, job_id: str, file_content: bytes, retry_count: int = 0) -> None:
-        """Process a document extraction job with retry mechanism.
+    def _process_single_page_sync(self, image, page_num, total_pages, file_format, extraction_id, job_id):
+        """Process a single page with OCR and update the database (synchronous version).
+
+        This is a non-async version of the method for use in background threads.
+        """
+        print(f"Processing page {page_num}/{total_pages}")
+
+        # Extract text using OCR
+        print(f"Performing OCR on page {page_num}...")
+        try:
+            ocr_result = self.text_extractor.extract_text(
+                image, doc_format=file_format)
+
+            # Convert OCR result to a serializable dictionary
+            ocr_dict = self.text_extractor.serialize_result(ocr_result)
+
+            # Extract the full text from text lines
+            full_text = "\n".join(
+                [line.text for line in ocr_result.text_lines]) if ocr_result.text_lines else ""
+
+            # Debug OCR results
+            text_sample = full_text[:100] + \
+                "..." if full_text else "[No text extracted]"
+            print(f"OCR result for page {page_num}: {text_sample}")
+            print(f"Extracted {len(ocr_result.text_lines)} text lines")
+
+            # Create page data with proper structure
+            text_chunks = []
+            if ocr_result.text_lines:
+                for line in ocr_result.text_lines:
+                    text_chunks.append({
+                        "text": line.text,
+                        "confidence": line.confidence,
+                        "position": {
+                            "x": line.bbox[0] if line.bbox else 0,
+                            "y": line.bbox[1] if line.bbox else 0,
+                            "width": line.bbox[2] if line.bbox else 0,
+                            "height": line.bbox[3] if line.bbox else 0
+                        }
+                    })
+
+            page_data = {
+                "pageNumber": page_num,
+                "text": full_text,
+                "textChunks": text_chunks,
+                "hasTable": False,  # Placeholder, table detection not implemented yet
+                "tables": []
+            }
+
+            print(
+                f"Created page data for page {page_num} with {len(text_chunks)} text chunks")
+
+            # Check if extraction document exists before updating
+            existing_doc = ragnor_doc_extractions_collection.find_one({"_id": extraction_id})
+            if not existing_doc:
+                print(f"WARNING: Extraction document {extraction_id} not found, creating it")
+                # Create the extraction document if it doesn't exist
+                extraction_doc = {
+                    "_id": extraction_id,
+                    "jobId": job_id,
+                    "totalPages": total_pages,
+                    "processedPages": [],
+                    "pageContents": [],
+                    "createdAt": datetime.utcnow(),
+                    "updatedAt": datetime.utcnow()
+                }
+                ragnor_doc_extractions_collection.insert_one(extraction_doc)
+
+            # Update the extraction document in the database with this page's data
+            try:
+                # Use $addToSet for processedPages to avoid duplicates
+                update_result = ragnor_doc_extractions_collection.update_one(
+                    {"_id": extraction_id},
+                    {
+                        "$addToSet": {
+                            "processedPages": page_num
+                        },
+                        "$push": {
+                            "pageContents": page_data
+                        },
+                        "$set": {
+                            "updatedAt": datetime.utcnow()
+                        }
+                    }
+                )
+                print(f"Updated extraction document with page {page_num} data, modified: {update_result.modified_count}")
+                
+                # Double check if the update succeeded
+                if update_result.modified_count == 0:
+                    print(f"WARNING: Failed to update extraction document {extraction_id}, trying alternate approach")
+                    # Try an alternative approach - first pull any existing entry for this page, then push the new one
+                    update_result = ragnor_doc_extractions_collection.update_one(
+                        {"_id": extraction_id},
+                        {
+                            "$pull": {
+                                "pageContents": {"pageNumber": page_num}
+                            }
+                        }
+                    )
+                    update_result = ragnor_doc_extractions_collection.update_one(
+                        {"_id": extraction_id},
+                        {
+                            "$push": {
+                                "pageContents": page_data
+                            },
+                            "$set": {
+                                "updatedAt": datetime.utcnow()
+                            }
+                        }
+                    )
+                    print(f"Alternative update approach result: {update_result.modified_count}")
+                
+                return True
+            except Exception as update_err:
+                print(f"Error updating extraction document with page data: {str(update_err)}")
+                print(f"Stack trace: {traceback.format_exc()}")
+                return False
+
+        except Exception as ocr_err:
+            print(f"ERROR during OCR processing: {str(ocr_err)}")
+            print(f"Stack trace:", traceback.format_exc())
+            print(
+                f"Image details: Format={file_format}, Size={image.size if hasattr(image, 'size') else 'unknown'}")
+            print(f"Tesseract path: {pytesseract.pytesseract.tesseract_cmd}")
+            print(
+                f"Tesseract exists: {os.path.exists(pytesseract.pytesseract.tesseract_cmd)}")
+            # Don't raise the error - we want to continue with other pages
+            print(
+                f"Continuing with next page despite OCR error on page {page_num}")
+            return False
+
+    async def _process_single_page(self, image, page_num, total_pages, file_format, extraction_id, job_id):
+        """Process a single page with OCR and update the database.
 
         Args:
-            job_id (str): The ID of the job to process
-            file_content (bytes): The document file content
-            retry_count (int): The current retry count
+            image (PIL.Image): The image to process
+            page_num (int): The page number (1-indexed)
+            total_pages (int): The total number of pages
+            file_format (str): The document format
+            extraction_id (str): The extraction document ID
+            job_id (str): The job ID
         """
-        MAX_RETRIES = 3
+        print(f"Processing page {page_num}/{total_pages}")
 
-        # Debug info
-        print(f"=== STARTING DOCUMENT PROCESSING ===")
-        print(f"Job ID: {job_id}")
-        print(f"File content size: {len(file_content)} bytes")
-        print(f"Retry count: {retry_count}")
-
-        # Force job processing to take some time to make it easier to test
-        # This ensures polling will actually show progress
-        MIN_PROCESSING_TIME = 15  # seconds for entire process
-
-        start_time = time.time()
+        # Extract text using OCR
+        print(f"Performing OCR on page {page_num}...")
         try:
-            # Verify file content exists and is not empty
-            if not file_content:
-                raise ValueError(f"No file content provided for job {job_id}")
+            ocr_result = self.text_extractor.extract_text(
+                image, doc_format=file_format)
 
-            # Update job status to processing
-            await self.update_job_status(job_id, JobStatus.PROCESSING, 0.0)
+            # Convert OCR result to a serializable dictionary
+            ocr_dict = self.text_extractor.serialize_result(ocr_result)
 
-            # Delay to simulate initial setup
-            print(f"Simulating initial processing setup...")
-            await asyncio.sleep(1)
+            # Extract the full text from text lines
+            full_text = "\n".join(
+                [line.text for line in ocr_result.text_lines]) if ocr_result.text_lines else ""
+
+            # Debug OCR results
+            text_sample = full_text[:100] + \
+                "..." if full_text else "[No text extracted]"
+            print(f"OCR result for page {page_num}: {text_sample}")
+            print(f"Extracted {len(ocr_result.text_lines)} text lines")
+
+            # Create page data with proper structure
+            text_chunks = []
+            if ocr_result.text_lines:
+                for line in ocr_result.text_lines:
+                    text_chunks.append({
+                        "text": line.text,
+                        "confidence": line.confidence,
+                        "position": {
+                            "x": line.bbox[0] if line.bbox else 0,
+                            "y": line.bbox[1] if line.bbox else 0,
+                            "width": line.bbox[2] if line.bbox else 0,
+                            "height": line.bbox[3] if line.bbox else 0
+                        }
+                    })
+
+            page_data = {
+                "pageNumber": page_num,
+                "text": full_text,
+                "textChunks": text_chunks,
+                "hasTable": False,  # Placeholder, table detection not implemented yet
+                "tables": []
+            }
+
+            print(
+                f"Created page data for page {page_num} with {len(text_chunks)} text chunks")
+
+            # Update the extraction document in the database with this page's data
+            try:
+                ragnor_doc_extractions_collection.update_one(
+                    {"_id": extraction_id},
+                    {
+                        "$push": {
+                            "processedPages": page_num,
+                            "pageContents": page_data
+                        },
+                        "$set": {
+                            "updatedAt": datetime.utcnow()
+                        }
+                    }
+                )
+                print(f"Updated extraction document with page {page_num} data")
+                return True
+            except Exception as update_err:
+                print(
+                    f"Error updating extraction document with page data: {str(update_err)}")
+                return False
+
+        except Exception as ocr_err:
+            print(f"ERROR during OCR processing: {str(ocr_err)}")
+            print(f"Stack trace:", traceback.format_exc())
+            print(
+                f"Image details: Format={file_format}, Size={image.size if hasattr(image, 'size') else 'unknown'}")
+            print(f"Tesseract path: {pytesseract.pytesseract.tesseract_cmd}")
+            print(
+                f"Tesseract exists: {os.path.exists(pytesseract.pytesseract.tesseract_cmd)}")
+            # Don't raise the error - we want to continue with other pages
+            print(
+                f"Continuing with next page despite OCR error on page {page_num}")
+            return False
+
+    def _process_document_in_background(self, job_id: str, file_content: bytes, retry_count: int = 0):
+        """Process a document in a background thread (non-async version).
+        This keeps the API responsive during intensive processing.
+        """
+        try:
+            # Set up MongoDB connection for this thread if needed
+            # Database operations here...
+
+            # Start the actual processing
+            print(f"=== STARTING BACKGROUND DOCUMENT PROCESSING ===")
+            print(f"Job ID: {job_id}")
+            print(f"File content size: {len(file_content)} bytes")
+            print(f"Retry count: {retry_count}")
 
             # Get job data
             job_doc = ragnor_doc_jobs_collection.find_one({"_id": job_id})
@@ -168,47 +396,137 @@ class RagnorDocumentProcessor:
             handler = get_handler_for_format(file_format)
             print(f"Using format handler: {handler.__class__.__name__}")
 
+            self._process_document_impl(
+                job_id, file_content, file_format, filename, handler, retry_count)
+
+        except Exception as e:
+            # Log and update job status if there's an error
+            print(f"ERROR in background processing for job {job_id}: {str(e)}")
+            # Update job status to failed
+            self._update_job_status_sync(
+                job_id, JobStatus.FAILED, 0.0, error_message=str(e))
+
+    def _update_job_status_sync(self, job_id, status, progress, result_id=None, error_message=None):
+        """Synchronous version of update_job_status for use in background thread"""
+        try:
+            # Prepare the update data
+            update_data = {
+                "status": status,
+                "progress": progress,
+                "updatedAt": datetime.utcnow()
+            }
+
+            if result_id:
+                update_data["resultId"] = result_id
+
+            if error_message:
+                update_data["errorMessage"] = error_message
+
+            if status == JobStatus.COMPLETED:
+                update_data["completedAt"] = datetime.utcnow()
+            elif status == JobStatus.FAILED:
+                update_data["failedAt"] = datetime.utcnow()
+
+            # Update in MongoDB
+            update_result = ragnor_doc_jobs_collection.update_one(
+                {"_id": job_id},
+                {"$set": update_data}
+            )
+
+            # Check if the update was successful
+            if update_result.modified_count > 0:
+                print(
+                    f"Job {job_id} status updated to {status}, progress {progress:.1f}%")
+            else:
+                print(f"Warning: Job {job_id} not found or not updated")
+
+        except Exception as e:
+            print(f"Error updating job status: {str(e)}")
+
+    async def process_document(self, job_id: str, file_content: bytes, retry_count: int = 0) -> None:
+        """Process a document extraction job with retry mechanism.
+        This method starts a background process and returns immediately to keep the API responsive.
+
+        Args:
+            job_id (str): The ID of the job to process
+            file_content (bytes): The document file content
+            retry_count (int): The current retry count
+        """
+        MAX_RETRIES = 3
+
+        # Debug info
+        print(
+            f"Starting background processing for job {job_id}, file size: {len(file_content)} bytes")
+
+        # Start processing in a background thread to keep API responsive
+        process_thread = threading.Thread(
+            target=self._process_document_in_background,
+            args=(job_id, file_content, retry_count)
+        )
+        process_thread.daemon = True  # Thread will exit when main thread exits
+        process_thread.start()
+
+        # Track the background task
+        self.background_tasks[job_id] = process_thread
+
+        print(f"Document processing started in background for job {job_id}")
+
+    def _process_document_impl(self, job_id: str, file_content: bytes, file_format: str, filename: str, handler, retry_count: int = 0):
+        """Implementation of document processing that runs in the background thread.
+        This is a non-async version that runs in a background thread.
+        """
+        MAX_RETRIES = 3
+
+        # Force job processing to take some time to make it easier to test
+        # This ensures polling will actually show progress
+        MIN_PROCESSING_TIME = 15  # seconds for entire process
+        start_time = time.time()
+
+        try:
+            # Debug info
+            print(f"=== STARTING DOCUMENT PROCESSING ===")
+            print(f"Job ID: {job_id}")
+            print(f"File content size: {len(file_content)} bytes")
+            print(f"Retry count: {retry_count}")
+
+            # Verify file content exists and is not empty
+            if not file_content:
+                raise ValueError(f"No file content provided for job {job_id}")
+
+            # Update job status to processing
+            self._update_job_status_sync(job_id, JobStatus.PROCESSING, 0.0)
+
+            # Delay to simulate initial setup
+            print(f"Simulating initial processing setup...")
+            time.sleep(1)
+
+            print(f"Processing document: {filename} (format: {file_format})")
+            print(f"Using format handler: {handler.__class__.__name__}")
+
             # Extract metadata (with delay to simulate real processing)
             print(f"Extracting document metadata...")
             # Delay to simulate metadata extraction time
-            await asyncio.sleep(2)
+            time.sleep(1)
             metadata = handler.extract_metadata(file_content, file_format)
             print(f"Extracted metadata: {metadata}")
-            await self.update_job_status(job_id, JobStatus.PROCESSING, 5.0)
+            self._update_job_status_sync(job_id, JobStatus.PROCESSING, 5.0)
 
-            # Convert document to images (this is time-consuming)
-            print(f"Converting document to images for OCR processing...")
-            # Simulate the time it takes to convert document to images
-            await asyncio.sleep(3)
-            images = handler.convert_to_images(file_content, file_format)
-            print(f"Successfully converted document to {len(images)} images")
+            # Special handling for PDFs - get page count and process pages one at a time
+            is_pdf = 'pdf' in file_format.lower()
+            total_pages = 0
 
-            # Save some debug information about the images
-            if images:
-                print(
-                    f"First image details: Size={images[0].size}, Mode={images[0].mode}")
+            if is_pdf:
+                # Use PDFHandler to get the page count
+                total_pages = PDFHandler.get_pdf_page_count(file_content)
 
-                # Save a sample image for debugging
-                debug_dir = os.path.join(
-                    os.path.dirname(__file__), "debug_images")
-                os.makedirs(debug_dir, exist_ok=True)
-                debug_path = os.path.join(
-                    debug_dir, f"job_{job_id}_sample.png")
-                images[0].save(debug_path)
-                print(f"Saved sample image to {debug_path}")
-            else:
-                print("WARNING: No images were extracted from the document!")
-
-            # Update progress
-            await self.update_job_status(job_id, JobStatus.PROCESSING, 15.0)
-
-            # Create extraction document with proper structure
+            # Create extraction document with initial structure
+            extraction_id = str(ObjectId())
             extraction_doc = {
-                "_id": str(ObjectId()),
+                "_id": extraction_id,
                 "jobId": job_id,
                 "filename": filename,
                 "fileFormat": file_format,
-                "totalPages": len(images),
+                "totalPages": total_pages,  # Will be updated if not determined yet
                 "processedPages": [],
                 "pageContents": [],
                 "metadata": metadata,
@@ -216,88 +534,240 @@ class RagnorDocumentProcessor:
                 "updatedAt": datetime.utcnow()
             }
 
-            # Process each image and extract text
-            print(f"Starting OCR text extraction on {len(images)} pages...")
-            total_pages = len(images)
-            processed_pages = []
-
-            for idx, image in enumerate(images):
-                page_num = idx + 1
-                print(f"Processing page {page_num}/{total_pages}")
-
-                # OCR processing can take a long time, here we'll add a delay to simulate
-                # the actual processing time and ensure our polling works correctly
-                # 2-4 seconds per page
-                await asyncio.sleep(2 + random.random() * 2)
-
-                # Extract text using OCR
-                print(f"Performing OCR on page {page_num}...")
-                try:
-                    ocr_result = self.text_extractor.extract_text(
-                        image, doc_format=file_format)
-
-                    # Convert OCR result to a serializable dictionary
-                    ocr_dict = self.text_extractor.serialize_result(ocr_result)
-
-                    # Extract the full text from text lines
-                    full_text = "\n".join(
-                        [line.text for line in ocr_result.text_lines]) if ocr_result.text_lines else ""
-
-                    # Debug OCR results
-                    text_sample = full_text[:100] + \
-                        "..." if full_text else "[No text extracted]"
-                    print(f"OCR result for page {page_num}: {text_sample}")
-                    print(f"Extracted {len(ocr_result.text_lines)} text lines")
-                except Exception as ocr_err:
-                    print(f"ERROR during OCR processing: {str(ocr_err)}")
-                    print(f"Stack trace:", traceback.format_exc())
-                    print(
-                        f"Image details: Format={file_format}, Size={image.size if hasattr(image, 'size') else 'unknown'}")
-                    print(
-                        f"Tesseract path: {pytesseract.pytesseract.tesseract_cmd}")
-                    print(
-                        f"Tesseract exists: {os.path.exists(pytesseract.pytesseract.tesseract_cmd)}")
-
-                    # Raise the error to stop processing - we want to diagnose the problem
-                    raise ocr_err
-
-                # Create page data with proper structure
-                text_chunks = []
-                if ocr_result.text_lines:
-                    for line in ocr_result.text_lines:
-                        text_chunks.append({
-                            "text": line.text,
-                            "confidence": line.confidence,
-                            "position": {
-                                "x": line.bbox[0] if line.bbox else 0,
-                                "y": line.bbox[1] if line.bbox else 0,
-                                "width": line.bbox[2] if line.bbox else 0,
-                                "height": line.bbox[3] if line.bbox else 0
-                            }
-                        })
-
-                page_data = {
-                    "pageNumber": page_num,
-                    "text": full_text,
-                    "textChunks": text_chunks,
-                    "hasTable": False,  # Placeholder, table detection not implemented yet
-                    "tables": []
-                }
-
+            # Initialize the extraction document in the database
+            try:
+                result = ragnor_doc_extractions_collection.insert_one(
+                    extraction_doc)
                 print(
-                    f"Created page data for page {page_num} with {len(text_chunks)} text chunks")
+                    f"Created initial extraction document with ID {extraction_id}")
+            except Exception as db_err:
+                print(
+                    f"Error creating initial extraction document: {str(db_err)}")
+                raise db_err
 
-                # Track successfully processed pages
-                processed_pages.append(page_num)
-                extraction_doc["processedPages"].append(page_num)
+            # Start document conversion and OCR processing
+            print(f"Starting document conversion and OCR processing...")
+            processed_pages = []
+            conversion_progress = 10.0  # Starting progress after metadata extraction
 
-                # Add the page to the page contents
-                extraction_doc["pageContents"].append(page_data)
+            # Update progress to indicate we're starting conversion
+            self._update_job_status_sync(
+                job_id, JobStatus.PROCESSING, conversion_progress)
 
-                # Update progress - adjust from 15% to 85% progress based on page completion
-                progress = 15.0 + (70.0 * (idx + 1) / len(images))
-                print(f"Page {page_num} complete. Progress: {progress:.1f}%")
-                await self.update_job_status(job_id, JobStatus.PROCESSING, progress)
+            # Handle PDFs and non-PDFs differently
+            if is_pdf and total_pages > 10:  # If it's a large PDF
+                # Process large PDFs page by page
+                print(
+                    f"Processing large PDF with {total_pages} pages one page at a time")
+
+                # Process pages one by one, starting immediate OCR on each page
+                for page_num in range(1, total_pages + 1):  # 1-indexed page numbers
+                    try:
+                        # Convert just this page to an image
+                        image = PDFHandler.convert_page_to_image(
+                            file_content, page_num, total_pages)
+
+                        # Immediately process this page with OCR
+                        self._process_single_page_sync(
+                            image, page_num, total_pages, file_format, extraction_id, job_id)
+                        processed_pages.append(page_num)
+
+                        # Update progress - scale from 10% to 90% based on page completion
+                        progress = 10.0 + \
+                            (80.0 * len(processed_pages) / total_pages)
+                        self._update_job_status_sync(
+                            job_id, JobStatus.PROCESSING, progress)
+
+                    except Exception as page_err:
+                        print(
+                            f"Error processing page {page_num}: {str(page_err)}")
+                        # Continue with other pages even if one fails
+                        continue
+            else:
+                # For non-PDFs or small PDFs, use the standard approach
+                converted_images = handler.convert_to_images(
+                    file_content, file_format)
+
+                # If we didn't know the total pages before, update it now
+                if total_pages == 0 and converted_images:
+                    total_pages = len(converted_images)
+                    print(
+                        f"Updated total page count to {total_pages} based on converted images")
+                    # Update the extraction document with the correct total page count
+                    try:
+                        ragnor_doc_extractions_collection.update_one(
+                            {"_id": extraction_id},
+                            {"$set": {"totalPages": total_pages}}
+                        )
+                    except Exception as update_err:
+                        print(
+                            f"Error updating total page count: {str(update_err)}")
+
+                # Save debug information about the first image if available
+                if converted_images and len(converted_images) > 0:
+                    print(
+                        f"First image details: Size={converted_images[0].size}, Mode={converted_images[0].mode}")
+
+                    # Save a sample image for debugging
+                    debug_dir = os.path.join(
+                        os.path.dirname(__file__), "debug_images")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    debug_path = os.path.join(
+                        debug_dir, f"job_{job_id}_sample.png")
+                    converted_images[0].save(debug_path)
+                    print(f"Saved sample image to {debug_path}")
+                else:
+                    print("WARNING: No images were extracted from the document!")
+
+                # Update progress now that we have the images
+                self._update_job_status_sync(
+                    job_id, JobStatus.PROCESSING, 15.0)
+
+                # Process each image and extract text
+                print(
+                    f"Starting OCR text extraction on {total_pages} pages...")
+
+                for idx, image in enumerate(converted_images):
+                    page_num = idx + 1
+                    # Process this page with OCR
+                    self._process_single_page_sync(
+                        image, page_num, total_pages, file_format, extraction_id, job_id)
+                    processed_pages.append(page_num)
+
+                    # Update progress - scale from 15% to 85% based on page completion
+                    progress = 15.0 + (70.0 * (idx + 1) / total_pages)
+                    print(
+                        f"Page {page_num} complete. Progress: {progress:.1f}%")
+                    self._update_job_status_sync(
+                        job_id, JobStatus.PROCESSING, progress)
+
+            # Verify that we've processed all pages as expected
+            print(
+                f"Finished processing all pages. Total pages: {total_pages}, Processed pages: {len(processed_pages)}")
+
+            # If some pages failed processing but we have at least one successful page, we can still consider the job successful
+            if len(processed_pages) < total_pages:
+                print(
+                    f"Warning: Not all pages were processed successfully. Processed {len(processed_pages)} out of {total_pages}")
+
+            # Extract the document format from the MIME type if available
+            doc_format = file_format.split(
+                "/")[1] if "/" in file_format else file_format
+            print(f"Document format determined as: {doc_format}")
+
+            # Before completing, ensure we meet minimum processing time for polling testing
+            elapsed_time = time.time() - start_time
+            if elapsed_time < MIN_PROCESSING_TIME:
+                remaining_time = MIN_PROCESSING_TIME - elapsed_time
+                print(
+                    f"Processing completed too quickly, adding {remaining_time:.1f}s delay to simulate real-world processing")
+                time.sleep(remaining_time)
+
+            # Update job in MongoDB to mark as completed
+            try:
+                update_result = ragnor_doc_jobs_collection.update_one(
+                    {"_id": job_id},
+                    {
+                        "$set": {
+                            "status": JobStatus.COMPLETED,
+                            "progress": 100.0,
+                            "completedAt": datetime.utcnow(),
+                            "updatedAt": datetime.utcnow(),
+                            "resultId": extraction_id
+                        }
+                    }
+                )
+                print(
+                    f"Job status update result: {update_result.modified_count} document(s) modified")
+
+                # Mark job as completed with the extraction document's ID
+                print(f"Marking job {job_id} as COMPLETED")
+                self._update_job_status_sync(
+                    job_id, JobStatus.COMPLETED, 100.0, result_id=extraction_id)
+
+                print(f"=== DOCUMENT PROCESSING COMPLETED SUCCESSFULLY ===")
+                print(f"Job ID: {job_id}")
+                print(f"Result ID: {extraction_id}")
+                print(
+                    f"Total processing time: {time.time() - start_time:.2f} seconds")
+
+            except Exception as update_err:
+                print(f"Error updating job status: {str(update_err)}")
+                raise update_err
+
+        except Exception as e:
+            # Log the error
+            error_message = f"Error processing document: {str(e)}"
+            print(error_message)
+            print(traceback.format_exc())
+
+            # Check if we can retry
+            if retry_count < MAX_RETRIES:
+                # Increment retry count
+                retry_count += 1
+
+                # Wait before retrying (exponential backoff)
+                retry_delay = 2 ** retry_count  # 2, 4, 8 seconds
+                print(
+                    f"Retrying job {job_id} in {retry_delay} seconds... (Attempt {retry_count} of {MAX_RETRIES})")
+                time.sleep(retry_delay)
+
+                # Retry processing
+                self._process_document_impl(
+                    job_id, file_content, file_format, filename, handler, retry_count)
+            else:
+                # Mark job as failed
+                print(
+                    f"ERROR in background processing for job {job_id}: {str(e)}")
+                self._update_job_status_sync(
+                    job_id, JobStatus.FAILED, 0.0, error_message=str(e))
+
+                # For non-PDFs or small PDFs, use the standard approach
+                converted_images = handler.convert_to_images(
+                    file_content, file_format)
+
+                # If we didn't know the total pages before, update it now
+                if total_pages == 0 and converted_images:
+                    total_pages = len(converted_images)
+                    print(
+                        f"Updated total page count to {total_pages} based on converted images")
+                    # Update the extraction document with the correct total page count
+                    try:
+                        ragnor_doc_extractions_collection.update_one(
+                            {"_id": extraction_id},
+                            {"$set": {"totalPages": total_pages}}
+                        )
+                    except Exception as update_err:
+                        print(
+                            f"Error updating total page count: {str(update_err)}")
+
+            # For small PDFs or non-PDFs, handle the regular way
+            if not (is_pdf and total_pages > 10):
+                # Save debug information about the first image if available
+                if converted_images and len(converted_images) > 0:
+                    print(
+                        f"First image details: Size={converted_images[0].size}, Mode={converted_images[0].mode}")
+
+                    # Save a sample image for debugging
+                    debug_dir = os.path.join(
+                        os.path.dirname(__file__), "debug_images")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    debug_path = os.path.join(
+                        debug_dir, f"job_{job_id}_sample.png")
+                    converted_images[0].save(debug_path)
+                for idx, image in enumerate(converted_images):
+                    page_num = idx + 1
+                    # Process this page with OCR
+                    self._process_single_page_sync(
+                        image, page_num, total_pages, file_format, extraction_id, job_id)
+                    processed_pages.append(page_num)
+
+                    # Update progress - scale from 15% to 85% based on page completion
+                    progress = 15.0 + (70.0 * (idx + 1) / total_pages)
+                    print(
+                        f"Page {page_num} complete. Progress: {progress:.1f}%")
+                    self._update_job_status_sync(
+                        job_id, JobStatus.PROCESSING, progress)
 
             # Verify that we've processed all pages as expected
             print(
@@ -326,22 +796,38 @@ class RagnorDocumentProcessor:
             print(
                 f"  Page Contents: {len(extraction_doc.get('pageContents', []))}")
 
-            # Check if document exists first
+            # Check if document exists first - ensure we have pages array
             try:
                 existing = ragnor_doc_extractions_collection.find_one(
                     {"_id": extraction_id})
                 if existing:
-                    print(
-                        f"Updating existing extraction document {extraction_id}")
-                    ragnor_doc_extractions_collection.update_one(
-                        {"_id": extraction_id},
-                        {"$set": extraction_doc}
-                    )
+                    print(f"Updating existing extraction document {extraction_id}")
+                    # Make sure we preserve any existing page data
+                    if "pageContents" in existing and len(existing["pageContents"]) > 0:
+                        print(f"Preserving {len(existing['pageContents'])} existing page contents")
+                        # Only update specific fields, not the entire document
+                        update_data = {
+                            "metadata": extraction_doc.get("metadata", {}),
+                            "totalPages": extraction_doc.get("totalPages", 0),
+                            "updatedAt": datetime.utcnow()
+                        }
+                        ragnor_doc_extractions_collection.update_one(
+                            {"_id": extraction_id},
+                            {"$set": update_data}
+                        )
+                    else:
+                        # No existing page data, safe to update whole document
+                        ragnor_doc_extractions_collection.update_one(
+                            {"_id": extraction_id},
+                            {"$set": extraction_doc}
+                        )
                 else:
-                    print(
-                        f"Creating new extraction document with ID {extraction_id}")
-                    result = ragnor_doc_extractions_collection.insert_one(
-                        extraction_doc)
+                    print(f"Creating new extraction document with ID {extraction_id}")
+                    # Initialize empty arrays for pages
+                    extraction_doc["processedPages"] = []
+                    extraction_doc["pageContents"] = []
+                    extraction_doc["pages"] = []
+                    result = ragnor_doc_extractions_collection.insert_one(extraction_doc)
                     print(f"MongoDB insert result: {result.inserted_id}")
             except Exception as db_err:
                 print(
@@ -353,7 +839,7 @@ class RagnorDocumentProcessor:
                 remaining_time = MIN_PROCESSING_TIME - elapsed_time
                 print(
                     f"Processing completed too quickly, adding {remaining_time:.1f}s delay to simulate real-world processing")
-                await asyncio.sleep(remaining_time)
+                time.sleep(remaining_time)
 
             # Update job in MongoDB to mark as completed
             try:
@@ -374,7 +860,8 @@ class RagnorDocumentProcessor:
 
                 # Mark job as completed with the extraction document's ID
                 print(f"Marking job {job_id} as COMPLETED")
-                await self.update_job_status(job_id, JobStatus.COMPLETED, 100.0, result_id=extraction_id)
+                self._update_job_status_sync(
+                    job_id, JobStatus.COMPLETED, 100.0, result_id=extraction_id)
 
                 print(f"=== DOCUMENT PROCESSING COMPLETED SUCCESSFULLY ===")
                 print(f"Job ID: {job_id}")
@@ -395,7 +882,7 @@ class RagnorDocumentProcessor:
                 retry_count += 1
 
                 # Update job status
-                await self.update_job_status(
+                self._update_job_status_sync(
                     job_id,
                     JobStatus.PROCESSING,
                     progress=0.0,
@@ -406,7 +893,7 @@ class RagnorDocumentProcessor:
                 backoff_time = 2 ** retry_count
                 print(
                     f"Retrying job {job_id} in {backoff_time} seconds... (Attempt {retry_count} of {MAX_RETRIES})")
-                await asyncio.sleep(backoff_time)
+                time.sleep(backoff_time)
 
                 # Update retry count in database
                 ragnor_doc_jobs_collection.update_one(
@@ -415,10 +902,12 @@ class RagnorDocumentProcessor:
                 )
 
                 # Retry processing
-                await self.process_document(job_id, file_content, retry_count)
+                # Can't call process_document directly as it's async
+                # Instead, we'll recursively call _process_document_impl
+                self._process_document_impl(job_id, file_content, file_format, filename, handler, retry_count)
             else:
                 # Max retries reached, mark job as failed
-                await self.update_job_status(
+                self._update_job_status_sync(
                     job_id,
                     JobStatus.FAILED,
                     error_message=f"{error_message} (after {MAX_RETRIES} retries)"
@@ -495,11 +984,22 @@ class RagnorDocumentProcessor:
                     "error": "Job not completed"
                 }
 
-            # Get extraction document
+            # Get extraction document - try both string jobId and ObjectId
             print(f"Looking up extraction document in MongoDB...")
             print(f"Querying with jobId: {job_id}")
-            extraction_doc = ragnor_doc_extractions_collection.find_one({
-                                                                        "jobId": job_id})
+            extraction_doc = ragnor_doc_extractions_collection.find_one({"jobId": job_id})
+            
+            # If not found with string ID, try with ObjectId
+            if not extraction_doc:
+                try:
+                    # Try to convert to ObjectId and search again
+                    from bson.objectid import ObjectId
+                    extraction_doc = ragnor_doc_extractions_collection.find_one({"jobId": ObjectId(job_id)})
+                    if extraction_doc:
+                        print(f"Found extraction with ObjectId jobId: {job_id}")
+                except:
+                    # If conversion fails, it's not a valid ObjectId
+                    print(f"Could not convert {job_id} to ObjectId for extraction lookup")
 
             if not extraction_doc:
                 print(
