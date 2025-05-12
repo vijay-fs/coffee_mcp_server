@@ -17,10 +17,7 @@ load_dotenv()
 
 # Main database configuration
 MONGO_URI = os.getenv("MONGODB_CONNECTION_STRING", "mongodb://localhost:27017")
-MONGO_DB = os.getenv("MONGODB_DATABASE", "adeos")
-
-# Ragnor database configuration
-MONGO_RAGNOR_DB = os.getenv("MONGODB_DATABASE_RAGNOR", "ragnor_docs")
+MONGO_DB = os.getenv("MONGODB_DATABASE", "ragnor_docs")
 
 # MongoDB client connection setup
 try:
@@ -55,17 +52,14 @@ try:
     # Test connection
     _client.admin.command('ping')
     logger.info("MongoDB connection successful")
-    
+
     # Set up main database
     _db = _client[MONGO_DB]
-    
-    # Set up Ragnor database
-    _ragnor_db = _client[MONGO_RAGNOR_DB]
-    
+
     # Test if we can write to the Ragnor database
-    test_result = _ragnor_db.command("ping")
+    test_result = _db.command("ping")
     if test_result.get("ok") == 1:
-        logger.info(f"Successfully connected to Ragnor database: {MONGO_RAGNOR_DB}")
+        logger.info(f"Successfully connected to Ragnor database: {MONGO_DB}")
     else:
         logger.error("Failed to ping Ragnor database")
         raise Exception("Failed to connect to Ragnor database")
@@ -81,27 +75,18 @@ def _safe_create_index(collection, keys, **kwargs):
     try:
         collection.create_index(keys, **kwargs)
     except Exception as e:
-        logger.warning(f"Could not create index {keys} on {collection.name}: {e}")
+        logger.warning(
+            f"Could not create index {keys} on {collection.name}: {e}")
 
 
-def get_collection(name, database=None):
+def get_collection(name):
     """Get a collection from the specified database"""
-    if database == "ragnor":
-        db = _ragnor_db
-    else:
-        db = _db
-        
-    return db.get_collection(name)
-
-
-def get_ragnor_collection(name):
-    """Get a collection from the Ragnor database"""
-    return get_collection(name, database="ragnor")
+    return _db.get_collection(name)
 
 
 # Collections with collection names in the ragnor_docs database
-ragnor_doc_jobs_collection = get_ragnor_collection("jobs")
-ragnor_doc_extractions_collection = get_ragnor_collection("extractions")
+ragnor_doc_jobs_collection = get_collection("jobs")
+ragnor_doc_extractions_collection = get_collection("extractions")
 
 # Create indexes for Ragnor collections
 # Job collection indexes
@@ -110,6 +95,7 @@ _safe_create_index(ragnor_doc_jobs_collection, [("status", 1)])
 _safe_create_index(ragnor_doc_jobs_collection, [("filename", 1)])
 
 # Extraction collection indexes
-_safe_create_index(ragnor_doc_extractions_collection, [("jobId", 1)], unique=True)
+_safe_create_index(ragnor_doc_extractions_collection,
+                   [("jobId", 1)], unique=True)
 _safe_create_index(ragnor_doc_extractions_collection, [("filename", 1)])
 _safe_create_index(ragnor_doc_extractions_collection, [("createdAt", -1)])
