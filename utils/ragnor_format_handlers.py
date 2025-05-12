@@ -85,10 +85,11 @@ class PDFHandler(FormatHandler):
                     last_page=1
                 )
                 
-                # Debug: Save first page image for debugging if debug path is configured
+                # Debug: Save first page image for debugging only if debug path is configured and not empty
                 if page_images and len(page_images) > 0:
                     debug_path_env = os.environ.get('RAGNOR_DEBUG_IMAGES_PATH')
-                    if debug_path_env:
+                    if debug_path_env and debug_path_env.strip():
+                        # Use exactly the path provided in the environment variable
                         debug_dir = debug_path_env
                         os.makedirs(debug_dir, exist_ok=True)
                         debug_path = os.path.join(debug_dir, "pdf_conversion_page_1.png")
@@ -116,10 +117,11 @@ class PDFHandler(FormatHandler):
             if not images:
                 raise ValueError("No images were extracted from the PDF")
 
-            # Debug: Save the first image for debugging if debug path is configured
+            # Debug: Save the first image for debugging only if debug path is configured and not empty
             if images:
                 debug_path_env = os.environ.get('RAGNOR_DEBUG_IMAGES_PATH')
-                if debug_path_env:
+                if debug_path_env and debug_path_env.strip():
+                    # Use exactly the path provided in the environment variable
                     debug_dir = debug_path_env
                     os.makedirs(debug_dir, exist_ok=True)
                     # Save first 2 pages for debugging
@@ -156,10 +158,11 @@ class PDFHandler(FormatHandler):
             if not page_images or len(page_images) == 0:
                 raise ValueError(f"Failed to convert page {page_num}")
                 
-            # Debug: Save image for debugging if path is configured
+            # Debug: Save image for debugging only if debug path is configured and not empty
             if page_num <= 2:  # Only save first 2 pages for debugging
                 debug_path_env = os.environ.get('RAGNOR_DEBUG_IMAGES_PATH')
-                if debug_path_env:
+                if debug_path_env and debug_path_env.strip():
+                    # Use exactly the path provided in the environment variable
                     debug_dir = debug_path_env
                     os.makedirs(debug_dir, exist_ok=True)
                     debug_path = os.path.join(debug_dir, f"pdf_conversion_page_{page_num}.png")

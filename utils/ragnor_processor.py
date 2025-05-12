@@ -826,22 +826,6 @@ class RagnorDocumentProcessor:
                         print(
                             f"Error updating total page count: {str(update_err)}")
 
-                # Save debug information about the first image if available
-                if converted_images and len(converted_images) > 0:
-                    print(
-                        f"First image details: Size={converted_images[0].size}, Mode={converted_images[0].mode}")
-
-                    # Save a sample image for debugging
-                    debug_dir = os.path.join(
-                        os.path.dirname(__file__), "debug_images")
-                    os.makedirs(debug_dir, exist_ok=True)
-                    debug_path = os.path.join(
-                        debug_dir, f"job_{job_id}_sample.png")
-                    converted_images[0].save(debug_path)
-                    print(f"Saved sample image to {debug_path}")
-                else:
-                    print("WARNING: No images were extracted from the document!")
-
                 # Update progress now that we have the images
                 self._update_job_status_sync(
                     job_id, JobStatus.PROCESSING, 15.0)
@@ -966,18 +950,6 @@ class RagnorDocumentProcessor:
 
             # For small PDFs or non-PDFs, handle the regular way
             if not (is_pdf and total_pages > 10):
-                # Save debug information about the first image if available
-                if converted_images and len(converted_images) > 0:
-                    print(
-                        f"First image details: Size={converted_images[0].size}, Mode={converted_images[0].mode}")
-
-                    # Save a sample image for debugging
-                    debug_dir = os.path.join(
-                        os.path.dirname(__file__), "debug_images")
-                    os.makedirs(debug_dir, exist_ok=True)
-                    debug_path = os.path.join(
-                        debug_dir, f"job_{job_id}_sample.png")
-                    converted_images[0].save(debug_path)
                 for idx, image in enumerate(converted_images):
                     page_num = idx + 1
                     # Process this page with OCR

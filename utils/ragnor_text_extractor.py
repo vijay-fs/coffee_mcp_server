@@ -84,10 +84,11 @@ class RagnorTextExtractor:
         try:
             # Print diagnostic info
             print(f"\n======== OCR EXTRACTION BEGIN ========")
-            print(f"Starting OCR extraction for format: {doc_format if doc_format else 'unknown'}")
+            print(
+                f"Starting OCR extraction for format: {doc_format if doc_format else 'unknown'}")
             print(f"Image info: Type={type(image)}, Mode={image.mode if hasattr(image, 'mode') else 'unknown'}, " +
                   f"Size={image.size if hasattr(image, 'size') else 'unknown'}")
-            
+
             # Check Tesseract installation
             tesseract_path = pytesseract.pytesseract.tesseract_cmd
             print(f"Tesseract path is set to: {tesseract_path}")
@@ -100,7 +101,8 @@ class RagnorTextExtractor:
             print(f"Checking Tesseract version with direct command...")
             try:
                 import subprocess
-                version = subprocess.check_output([tesseract_path, '--version'], stderr=subprocess.STDOUT)
+                version = subprocess.check_output(
+                    [tesseract_path, '--version'], stderr=subprocess.STDOUT)
                 print(f"Tesseract version: {version.decode('utf-8')}")
             except Exception as ver_err:
                 print(f"Error checking Tesseract version: {str(ver_err)}")
@@ -113,82 +115,65 @@ class RagnorTextExtractor:
             # Select the appropriate tesseract configuration based on document format
             if doc_format and doc_format in self.format_configs:
                 config = self.format_configs[doc_format]
-                print(f"Using format-specific OCR config for {doc_format}: {config}")
+                print(
+                    f"Using format-specific OCR config for {doc_format}: {config}")
             else:
                 config = self.format_configs['default']
                 print(f"Using default OCR config: {config}")
 
-            # Debug: Save a copy of the image being sent to OCR
-            try:
-                debug_dir = os.path.join(
-                    os.path.dirname(__file__), "debug_images")
-                os.makedirs(debug_dir, exist_ok=True)
-
-                # Generate a unique filename
-                import hashlib
-                img_hash = hashlib.md5(
-                    str(time.time()).encode()).hexdigest()[:8]
-                debug_path = os.path.join(
-                    debug_dir, f"ocr_input_{img_hash}.png")
-
-                # Save the image
-                image.save(debug_path)
-                print(f"Saved OCR input image to {debug_path}")
-            except Exception as debug_err:
-                print(f"Warning: Failed to save debug image: {str(debug_err)}")
-
             # Force OCR to run with Tesseract directly
             print("\n==== RUNNING REAL OCR EXTRACTION ====\n")
             print("Saving image to temporary file for OCR...")
-            
+
             # Save image to a temporary file first
             import tempfile
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp:
                 temp_path = temp.name
                 image.save(temp_path)
                 print(f"Saved image to {temp_path}")
-            
+
             # Run Tesseract directly using subprocess for maximum transparency
             print("Running Tesseract directly via subprocess...")
             try:
                 import subprocess
                 import tempfile
-                
+
                 # Create a temporary file for the output
                 with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as out_temp:
                     out_path = out_temp.name
-                
+
                 # Build the command with all options
                 tesseract_cmd = pytesseract.pytesseract.tesseract_cmd
-                
+
                 # Split the config string into separate arguments
                 config_args = config.split()
                 cmd = [tesseract_cmd, temp_path, out_path.replace('.txt', '')]
                 cmd.extend(config_args)
-                
+
                 print(f"Running command: {' '.join(cmd)}")
-                
+
                 # Execute Tesseract
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 print(f"Tesseract return code: {result.returncode}")
                 if result.stderr:
                     print(f"Tesseract stderr: {result.stderr}")
-                
+
                 # Read the output file
                 with open(out_path, 'r') as f:
                     extracted_text = f.read()
-                
-                print(f"Successfully extracted {len(extracted_text)} characters of text")
+
+                print(
+                    f"Successfully extracted {len(extracted_text)} characters of text")
                 print(f"First 100 chars: {extracted_text[:100]}...")
-                
+
                 # Clean up temporary files
                 os.unlink(temp_path)
                 os.unlink(out_path)
-                
+
                 # Create TextLine objects from the extracted text
                 width, height = image.size
                 text_lines = []
-                
+
                 if extracted_text.strip():
                     # Split text by lines and create a TextLine for each
                     for i, line in enumerate(extracted_text.strip().split('\n')):
@@ -200,7 +185,7 @@ class RagnorTextExtractor:
                                 # Simple positioning - one line below another
                                 bbox=[0, i*20, width, 20]
                             ))
-                
+
                 print(f"Created {len(text_lines)} text lines from extraction")
                 print("\n==== COMPLETED REAL OCR EXTRACTION ====\n")
             except Exception as ocr_err:
@@ -208,26 +193,30 @@ class RagnorTextExtractor:
                 # Log full details and raise the error
                 print(f"OCR failed with error: {str(ocr_err)}")
                 raise
-                
+
                 # For debugging, check if test mode is enabled, which might be causing issues
-                is_test_mode = os.environ.get('RAGNOR_TEST_MODE', 'false').lower() == 'true'
+                is_test_mode = os.environ.get(
+                    'RAGNOR_TEST_MODE', 'false').lower() == 'true'
                 if is_test_mode:
-                    print("WARNING: RAGNOR_TEST_MODE is enabled! This forces mock data generation.")
+                    print(
+                        "WARNING: RAGNOR_TEST_MODE is enabled! This forces mock data generation.")
                     print("Set this environment variable to 'false' to use real OCR.")
-                
+
                 # Try to troubleshoot common Tesseract issues
                 tesseract_path = pytesseract.pytesseract.tesseract_cmd
                 print(f"Tesseract path is set to: {tesseract_path}")
-                print(f"Checking if Tesseract exists at this path: {os.path.exists(tesseract_path)}")
-                
+                print(
+                    f"Checking if Tesseract exists at this path: {os.path.exists(tesseract_path)}")
+
                 # Try a basic command to see if Tesseract is working
                 try:
                     import subprocess
-                    version = subprocess.check_output([tesseract_path, '--version'], stderr=subprocess.STDOUT)
+                    version = subprocess.check_output(
+                        [tesseract_path, '--version'], stderr=subprocess.STDOUT)
                     print(f"Tesseract version: {version.decode('utf-8')}")
                 except Exception as ver_err:
                     print(f"Error checking Tesseract version: {str(ver_err)}")
-                
+
                 # Raise the original error to make it visible in logs
                 raise ocr_err
 
