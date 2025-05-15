@@ -35,24 +35,28 @@ OCR_PROCESS_POOL = multiprocessing.Pool(processes=2)
 class RagnorDocumentProcessor:
     """Main processor for document extraction."""
 
-    def __init__(self, embedding_provider="openai"):
+    def __init__(self, embedding_provider="azure"):
         """Initialize the document processor."""
         self.text_extractor = RagnorTextExtractor()
+        print(f"Initializing RagnorDocumentProcessor with provider: {embedding_provider}")
         try:
+            print(f"Getting embedding generator for provider: {embedding_provider}")
             self.embedding_generator = get_embedding_generator(
                 embedding_provider)
-        except ValueError:
-            print(
-                f"Warning: Could not initialize embedding generator for {embedding_provider}. Embeddings will not be generated.")
+            print(f"Successfully initialized embedding generator: {self.embedding_generator.__class__.__name__}")
+            print(f"Embedding model: {self.embedding_generator.model}")
+        except Exception as e:
+            print(f"Error initializing embedding generator for {embedding_provider}: {str(e)}")
+            print(f"Warning: Could not initialize embedding generator for {embedding_provider}. Embeddings will not be generated.")
             self.embedding_generator = None
         self.background_tasks = {}  # Keep track of background tasks
 
-    def generate_embeddings_for_text(self, text: str, provider: str = "openai"):
+    def generate_embeddings_for_text(self, text: str, provider: str = "azure"):
         """Generate embeddings for the given text using the specified provider.
 
         Args:
             text: The text to generate embeddings for
-            provider: The embedding provider to use (default: "openai")
+            provider: The embedding provider to use (default: "azure")
 
         Returns:
             Tuple containing (embeddings, model_name, success_flag)
@@ -62,18 +66,20 @@ class RagnorDocumentProcessor:
             return [], "", False
 
         try:
-            from utils.ragnor_embedding_generator import OpenAIEmbeddingGenerator
+            from utils.ragnor_embedding_generator import get_embedding_generator
             print(f"Generating embeddings for text using {provider}")
 
             # Create embedding generator based on provider
-            if provider.lower() == "openai":
-                embedding_generator = OpenAIEmbeddingGenerator()
+            try:
+                # Use the provider directly - get_embedding_generator supports 'openai', 'azure', 'azure-openai', and 'modal'
+                print(f"Creating embedding generator with provider: {provider}")
+                embedding_generator = get_embedding_generator(provider)
                 embedding_model = embedding_generator.model
-            else:
-                print(
-                    f"Unsupported embedding provider: {provider}, defaulting to OpenAI")
-                embedding_generator = OpenAIEmbeddingGenerator()
-                embedding_model = embedding_generator.model
+                print(f"Successfully created embedding generator with model: {embedding_model}")
+            except ValueError as e:
+                print(f"Error with provider {provider}: {str(e)}")
+                # Don't fall back to OpenAI, just re-raise the error
+                raise
 
             # Generate embeddings for the text
             embeddings = embedding_generator.generate_embeddings(text)
@@ -274,23 +280,36 @@ class RagnorDocumentProcessor:
             if generate_embeddings and full_text.strip():
                 print(
                     f"Generating embeddings for page {page_num} text using {embedding_provider}")
-                embeddings, embedding_model, success = self.generate_embeddings_for_text(
-                    full_text, embedding_provider)
+                try:
+                    # Use the document processor's existing embedding generator directly
+                    if hasattr(self, 'embedding_generator') and self.embedding_generator:
+                        print(f"Using document processor's embedding generator directly")
+                        embedding_generator = self.embedding_generator
+                        embeddings = embedding_generator.generate_embeddings(full_text)
+                        embedding_model = embedding_generator.model
+                        success = bool(embeddings)
+                    else:
+                        print(f"No embedding generator available, using generate_embeddings_for_text")
+                        embeddings, embedding_model, success = self.generate_embeddings_for_text(
+                            full_text, embedding_provider="azure")
 
-                if success and embeddings:
-                    # Add embeddings right after text in the page data
-                    print(f"DEBUG: Adding embeddings to page {page_num} data")
-                    page_data["embeddings"] = embeddings
-                    page_data["embeddingModel"] = embedding_model
-                    page_data["hasEmbeddings"] = True
-                    # Print the type and a sample to verify
-                    print(
-                        f"DEBUG: Embeddings type: {type(embeddings)}, length: {len(embeddings)}")
-                    print(f"DEBUG: First few values: {embeddings[:3]}")
-                else:
-                    # Continue without embeddings
-                    print(
-                        f"DEBUG: No valid embeddings generated for page {page_num}")
+                    if success and embeddings:
+                        # Add embeddings right after text in the page data
+                        print(f"DEBUG: Adding embeddings to page {page_num} data")
+                        page_data["embeddings"] = embeddings
+                        page_data["embeddingModel"] = embedding_model
+                        page_data["hasEmbeddings"] = True
+                        # Print the type and a sample to verify
+                        print(
+                            f"DEBUG: Embeddings type: {type(embeddings)}, length: {len(embeddings)}")
+                        print(f"DEBUG: First few values: {embeddings[:3]}")
+                    else:
+                        # Continue without embeddings
+                        print(
+                            f"DEBUG: No valid embeddings generated for page {page_num}")
+                        page_data["hasEmbeddings"] = False
+                except Exception as e:
+                    print(f"Error generating embeddings: {str(e)}")
                     page_data["hasEmbeddings"] = False
             else:
                 print(f"DEBUG: Embeddings not requested for page {page_num}")
@@ -329,32 +348,46 @@ class RagnorDocumentProcessor:
                 if generate_embeddings and full_text.strip():
                     print(f"DEBUG: Generating embeddings for MongoDB update")
                     # Generate embeddings right before MongoDB update
-                    embeddings, embedding_model, success = self.generate_embeddings_for_text(
-                        full_text, embedding_provider)
-
-                    if success and embeddings:
-                        print(
-                            f"DEBUG: Successfully generated {len(embeddings)} embeddings")
-
-                        # Force a new ordered document with embeddings
-                        ordered_page_data = {
-                            "pageNumber": page_num,
-                            "text": full_text,
-                            "embeddings": embeddings,  # Force embeddings here
-                            "embeddingModel": embedding_model,
-                            "hasEmbeddings": True,
-                            "textChunks": page_data["textChunks"],
-                            "hasTable": False,
-                            "tables": []
-                        }
-                        page_data = ordered_page_data
-                        print(
-                            f"DEBUG: Created ordered page data with embeddings in position 3")
-                        print(
-                            f"DEBUG: Keys in order: {list(page_data.keys())}")
-                    else:
-                        print(
-                            f"ERROR: Failed to generate embeddings before MongoDB update")
+                    embeddings = []
+                    embedding_model = ""
+                    success = False
+                    
+                    try:
+                        # Use the document processor's existing embedding generator directly
+                        if hasattr(self, 'embedding_generator') and self.embedding_generator:
+                            print(f"Using document processor's embedding generator directly")
+                            embedding_generator = self.embedding_generator
+                            embeddings = embedding_generator.generate_embeddings(full_text)
+                            embedding_model = embedding_generator.model
+                            success = bool(embeddings)
+                        else:
+                            print(f"No embedding generator available, using generate_embeddings_for_text")
+                            embeddings, embedding_model, success = self.generate_embeddings_for_text(
+                                full_text, embedding_provider="azure")
+                                
+                        if success and embeddings:
+                            print(f"DEBUG: Successfully generated {len(embeddings)} embeddings")
+                        else:
+                            print(f"ERROR: Failed to generate embeddings before MongoDB update")
+                            success = False
+                    except Exception as e:
+                        print(f"Error generating embeddings for MongoDB update: {str(e)}")
+                        success = False
+                    
+                    # Force a new ordered document with embeddings
+                    ordered_page_data = {
+                        "pageNumber": page_num,
+                        "text": full_text,
+                        "embeddings": embeddings,  # Force embeddings here
+                        "embeddingModel": embedding_model,
+                        "hasEmbeddings": success,
+                        "textChunks": page_data["textChunks"],
+                        "hasTable": False,
+                        "tables": []
+                    }
+                    page_data = ordered_page_data
+                    print(f"DEBUG: Created ordered page data with embeddings in position 3")
+                    print(f"DEBUG: Keys in order: {list(page_data.keys())}")
 
                 # Use direct MongoDB operations to ensure embeddings are included
                 print(f"DEBUG: Using direct MongoDB operations to store embeddings")
@@ -385,22 +418,45 @@ class RagnorDocumentProcessor:
                 job_doc = ragnor_doc_jobs_collection.find_one({"_id": job_id})
                 should_generate_embeddings = job_doc.get(
                     "embedding", False) if job_doc else generate_embeddings
+                
+                # Get the embedding provider from the job document
+                job_embedding_provider = job_doc.get("embedding_provider", "azure") if job_doc else "azure"
+                print(f"Job embedding provider setting: {job_embedding_provider}")
 
                 if should_generate_embeddings and full_text.strip():
                     print(
                         f"FORCING EMBEDDINGS GENERATION for page {page_num} based on job settings")
-                    embeddings, embedding_model, success = self.generate_embeddings_for_text(
-                        full_text, embedding_provider)
+                    try:
+                        # Always use the document processor's embedding generator directly
+                        if hasattr(self, 'embedding_generator') and self.embedding_generator:
+                            current_provider = self.embedding_generator.__class__.__name__
+                            print(f"Using document processor embedding generator: {current_provider}")
+                            embedding_generator = self.embedding_generator
+                            embedding_model = embedding_generator.model
+                            print(f"Generating embeddings with model: {embedding_model}")
+                            embeddings = embedding_generator.generate_embeddings(full_text)
+                            success = bool(embeddings)
+                        else:
+                            print(f"No embedding generator available in processor")
+                            # Don't call generate_embeddings_for_text as it might use OpenAI
+                            embeddings = []
+                            embedding_model = "none" 
+                            success = False
 
-                    if success and embeddings:
-                        print(
-                            f"SUCCESS: Generated {len(embeddings)} embeddings for forced storage")
-                        has_embeddings = True
-                    else:
-                        print(
-                            f"ERROR: Failed to generate embeddings even with forced approach")
+                        if success and embeddings:
+                            print(
+                                f"SUCCESS: Generated {len(embeddings)} embeddings for forced storage")
+                            has_embeddings = True
+                        else:
+                            print(
+                                f"WARN: No embeddings generated")
+                            embeddings = []
+                            embedding_model = "none"
+                            has_embeddings = False
+                    except Exception as e:
+                        print(f"ERROR during embedding generation: {str(e)}")
                         embeddings = []
-                        embedding_model = "openai"
+                        embedding_model = "none"
                         has_embeddings = False
                 else:
                     print(

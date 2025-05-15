@@ -17,18 +17,30 @@ from db.ragnor_db_models import JobStatus
 router = APIRouter()
 
 # Initialize document processor
-document_processor = RagnorDocumentProcessor()
+print("Initializing RagnorDocumentProcessor with azure provider")
+document_processor = RagnorDocumentProcessor(embedding_provider="azure")
+print(f"Document processor initialized: {document_processor}")
+print(f"Using embedding generator: {document_processor.embedding_generator.__class__.__name__ if document_processor.embedding_generator else 'None'}")
 
 # Background task for processing documents
 
 
-async def process_document_task(job_id: str, file_content: bytes, embedding: bool = False, embedding_provider: str = "openai"):
+async def process_document_task(job_id: str, file_content: bytes, embedding: bool = False, embedding_provider: str = "azure"):
     """Background task for processing a document."""
     print(
         f"Starting background processing for job {job_id}, file size: {len(file_content)} bytes, embedding={embedding}")
+    print(f"Using embedding provider: {embedding_provider}")
+    
     try:
         # Delay processing a bit to ensure job creation has completed
         await asyncio.sleep(1)
+        
+        # Use the same embedding generator instance from the document_processor
+        # This avoids creating a new instance which might fail with a different provider
+        if document_processor and document_processor.embedding_generator:
+            print(f"Using existing document processor embedding generator: {document_processor.embedding_generator.__class__.__name__}")
+        else:
+            print(f"WARNING: Document processor has no embedding generator configured")
 
         # Perform the actual document processing
         await document_processor.process_document(job_id, file_content, embedding=embedding, embedding_provider=embedding_provider)
@@ -69,7 +81,7 @@ class JobStatusResponse(BaseModel):
 async def extract_data(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    embedding_provider: str = Form("openai"),
+    embedding_provider: str = Form("azure"),
     embedding: bool = Form(False),
 ):
     """
@@ -146,8 +158,15 @@ async def extract_data(
 
         # Add document processing to background tasks with explicit embedding parameters
         print(f"API Request: embedding={embedding}, provider={embedding_provider}")
+        
         # Store embedding flag in job document for reference
         await document_processor.update_job_metadata(job_id, {"embedding": embedding, "embedding_provider": embedding_provider})
+        
+        # Add debugging info
+        print(f"Starting document processing task with provider: {embedding_provider}")
+        print(f"Using document processor with generator: {document_processor.embedding_generator.__class__.__name__ if document_processor.embedding_generator else 'None'}")
+        
+        # Start the background processing task
         background_tasks.add_task(process_document_task, job_id, file_content, embedding, embedding_provider)
 
         # Return job ID and initial status
