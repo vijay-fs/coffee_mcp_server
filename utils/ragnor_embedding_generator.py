@@ -14,7 +14,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODAL_API_KEY = os.getenv("MODAL_API_KEY")
 
 # Default embedding models
-DEFAULT_OPENAI_MODEL = "text-embedding-ada-002"
+DEFAULT_OPENAI_MODEL = "text-embedding-3-large"
 DEFAULT_MODAL_MODEL = "e5-large-v2"
 
 

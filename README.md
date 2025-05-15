@@ -188,7 +188,7 @@ Get the result of a completed document extraction job.
           "text": "Text chunk content...",
           "bbox": [100, 200, 300, 400],
           "embeddings": [0.12, 0.34, 0.56, ...],
-          "embedding_model": "text-embedding-ada-002"
+          "embedding_model": "text-embedding-3-large"
         }
       ],
       "hasTable": true,
