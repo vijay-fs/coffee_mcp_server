@@ -15,7 +15,7 @@ pytesseract==0.3.10
 pillow==11.2.1
 pdf2image==1.17.0
 pypdf2==3.0.1
-
+pycryptodome
 # API Services
 openai==1.77.0
 requests==2.32.3
