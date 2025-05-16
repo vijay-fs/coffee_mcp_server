@@ -54,6 +54,68 @@ class PDFHandler(FormatHandler):
         except Exception as e:
             print(f"Error reading PDF page count: {str(e)}")
             return 0
+    
+    @staticmethod
+    def is_page_scanned(file_content: bytes, page_num: int) -> bool:
+        """
+        Determine if a specific PDF page is scanned or text-based.
+        
+        Args:
+            file_content: The PDF file content as bytes
+            page_num: The 1-indexed page number to check
+            
+        Returns:
+            bool: True if the page is likely scanned, False if likely text-based
+        """
+        try:
+            # Import the PDF analyzer module
+            from utils.ragnor_pdf_analyzer import analyze_pdf
+            
+            # Analyze the PDF to get a list of which pages are scanned
+            scanned_pages = analyze_pdf(file_content)
+            
+            # Check if the requested page is in range
+            if 0 <= page_num - 1 < len(scanned_pages):
+                return scanned_pages[page_num - 1]
+            else:
+                # If out of range, assume scanned to be safe
+                print(f"Warning: Page {page_num} is out of analyzed range, assuming scanned")
+                return True
+        except Exception as e:
+            print(f"Error checking if page is scanned: {str(e)}")
+            # If anything fails, assume scanned to fall back to OCR
+            return True
+    
+    @staticmethod
+    def extract_text_from_page(file_content: bytes, page_num: int) -> str:
+        """
+        Extract text directly from a text-based PDF page using pdfplumber.
+        
+        Args:
+            file_content: The PDF file content as bytes
+            page_num: The 1-indexed page number to extract text from
+            
+        Returns:
+            str: The extracted text, or empty string if extraction fails
+        """
+        try:
+            # Import pdfplumber here to avoid circular imports
+            import pdfplumber
+            import io
+            
+            # Open the PDF
+            with pdfplumber.open(io.BytesIO(file_content)) as pdf:
+                # Check if page is in range
+                if page_num <= len(pdf.pages):
+                    # Extract text from the page
+                    page = pdf.pages[page_num - 1]  # Convert to 0-indexed
+                    return page.extract_text() or ""
+                else:
+                    print(f"Error: Page {page_num} is out of range")
+                    return ""
+        except Exception as e:
+            print(f"Error extracting text from page {page_num}: {str(e)}")
+            return ""
             
     @staticmethod
     def convert_to_images(file_content: bytes, file_format: str) -> List[Image.Image]:
