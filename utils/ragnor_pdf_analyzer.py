@@ -3,8 +3,12 @@ PDF analyzer utilities for Ragnor document extraction API.
 Provides functions to determine if PDF pages are text-based or scanned.
 """
 import io
+import logging
 import pdfplumber
 from typing import Dict, List, Tuple
+
+# Configure logging to suppress pdfminer warnings about CropBox
+logging.getLogger('pdfminer').setLevel(logging.ERROR)
 
 
 def is_scanned_page(page_content: Dict) -> bool:
