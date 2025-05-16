@@ -60,3 +60,34 @@ coffee_mcp_server/
 ├── requirements.txt # Production dependencies
 ├── requirements-dev.txt # Development dependencies
 └── README.md # Project readme
+
+## Changelog
+
+### May 16, 2025 - Hybrid PDF Extraction System Implementation
+
+The hybrid PDF extraction system has been implemented to optimize text extraction from PDFs. This system intelligently handles both text-based and scanned PDF pages, using the most appropriate extraction method for each page type.
+
+Key changes include:
+
+1. Created a new module `ragnor_pdf_analyzer.py` that:
+   - Analyzes PDFs to determine which pages are scanned vs. text-based
+   - Provides functions to extract text directly from text-based PDF pages using pdfplumber
+   - Contains heuristics to detect scanned pages based on text content analysis
+
+2. Enhanced the `PDFHandler` class with new methods:
+   - `is_page_scanned()` to determine if a page is scanned or text-based
+   - `extract_text_from_page()` to directly extract text from text-based PDF pages
+
+3. Added a new `_process_text_page()` method to the `RagnorDocumentProcessor` class to:
+   - Process text-based PDF pages with direct text extraction
+   - Generate embeddings for text content if requested
+   - Store the extracted text with the extraction method marked as "pdfplumber"
+
+4. Updated the document processing workflow to:
+   - Check each PDF page to determine if it's scanned or text-based
+   - Use pdfplumber for text-based pages and existing OCR for scanned pages
+   - Apply this approach to both large PDFs (>10 pages) and smaller PDFs
+
+5. Added an "extractionMethod" field to the output structure to track whether text was extracted using:
+   - "pdfplumber" for text-based PDF pages
+   - "tesseract_ocr" for scanned pages
