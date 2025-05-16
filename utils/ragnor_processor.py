@@ -11,25 +11,47 @@ import random
 import traceback
 import threading
 import multiprocessing
+import warnings
+import logging
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
 from bson import ObjectId
+from functools import partial
 
 import pytesseract
 from PIL import Image
 
 from db.ragnor_db_models import JobStatus, RagnorDocJob, RagnorDocExtraction, PageContent, TextChunk
 from db.db import ragnor_doc_jobs_collection, ragnor_doc_extractions_collection
+
+# Add a new collection for storing page contents separately
+from pymongo import MongoClient
+from os import getenv
+
+# Connect to MongoDB
+client = MongoClient(getenv('MONGODB_CONNECTION_STRING', 'mongodb://localhost:27017'))
+db = client[getenv('MONGODB_DATABASE', 'ragnor_docs')]
+
+# Create collections
+ragnor_page_contents_collection = db['ragnor_page_contents']
 from utils.ragnor_format_handlers import get_handler_for_format, FormatHandler, PDFHandler
 from utils.ragnor_text_extractor import RagnorTextExtractor, OCRResult
 from utils.ragnor_embedding_generator import get_embedding_generator
 
+# Suppress pdfminer warnings
+logging.getLogger('pdfminer').setLevel(logging.ERROR)
+
 # Initialize the text extractor
 text_extractor = RagnorTextExtractor()
 
+# Determine the number of CPU cores available for multiprocessing
+NUM_CORES = max(1, multiprocessing.cpu_count() - 1)  # Leave one core free for system
+print(f"Using {NUM_CORES} CPU cores for multiprocessing")
+
 # Create a process pool for OCR processing
 # This will allow the API to remain responsive during heavy processing
-OCR_PROCESS_POOL = multiprocessing.Pool(processes=2)
+OCR_PROCESS_POOL = multiprocessing.Pool(processes=NUM_CORES)
 
 
 class RagnorDocumentProcessor:
@@ -925,6 +947,84 @@ class RagnorDocumentProcessor:
 
         print(f"Document processing started in background for job {job_id}")
 
+    @staticmethod
+    def _process_page_parallel(page_params):
+        """Static method to process a single page in a separate process.
+        This needs to be a static method for proper pickling with multiprocessing."""
+        """Process a single page in a separate process.
+        This method is designed to be called within a multiprocessing Pool.
+        
+        Args:
+            page_params: Dictionary containing parameters for processing a page:
+                - file_content: The document file content
+                - page_num: The page number to process
+                - total_pages: Total number of pages in document
+                - is_scanned: Whether the page is scanned (requires OCR) or text-based
+                - file_format: The format of the document
+                - job_id: The job ID
+                - extraction_id: The extraction document ID
+                - embedding: Whether to generate embeddings
+                - embedding_provider: Provider to use for embeddings
+        
+        Returns:
+            Dictionary with processing results including page number, success status, and error if any
+        """
+        try:
+            file_content = page_params['file_content']
+            page_num = page_params['page_num']
+            total_pages = page_params['total_pages']
+            is_scanned = page_params['is_scanned']
+            file_format = page_params['file_format']
+            job_id = page_params['job_id']
+            extraction_id = page_params['extraction_id']
+            embedding = page_params.get('embedding', False)
+            embedding_provider = page_params.get('embedding_provider', 'azure')
+            
+            print(f"[Process {os.getpid()}] Processing page {page_num}/{total_pages}")
+            
+            success = False
+            error = None
+            
+            try:
+                if is_scanned:
+                    # For scanned pages, use the existing OCR process
+                    print(f"[Process {os.getpid()}] Page {page_num} is a scanned page, using OCR")
+                    # Convert page to image
+                    image = PDFHandler.convert_page_to_image(file_content, page_num, total_pages)
+                    # Process with OCR
+                    success = self._process_single_page_sync(
+                        image, page_num, total_pages, file_format, extraction_id, job_id,
+                        generate_embeddings=embedding, embedding_provider=embedding_provider)
+                else:
+                    # For text-based pages, use pdfplumber
+                    print(f"[Process {os.getpid()}] Page {page_num} is a text-based page, using pdfplumber")
+                    text = PDFHandler.extract_text_from_page(file_content, page_num)
+                    print(f"[Process {os.getpid()}] Extracted {len(text)} characters from page {page_num}")
+                    # Process the text directly
+                    success = self._process_text_page(
+                        text, page_num, total_pages, file_format, extraction_id, job_id,
+                        generate_embeddings=embedding, embedding_provider=embedding_provider)
+            except Exception as e:
+                error = str(e)
+                traceback.print_exc()
+                print(f"[Process {os.getpid()}] Error processing page {page_num}: {error}")
+                
+            return {
+                'page_num': page_num,
+                'success': success,
+                'error': error
+            }
+        except Exception as outer_e:
+            # Catch any exceptions that might occur outside the inner try block
+            outer_error = str(outer_e)
+            traceback.print_exc()
+            print(f"[Process {os.getpid()}] Critical error in _process_page_parallel for page {page_params.get('page_num')}: {outer_error}")
+            return {
+                'page_num': page_params.get('page_num', 0),
+                'success': False,
+                'error': outer_error
+            }
+    
     def _process_document_impl(self, job_id: str, file_content: bytes, file_format: str, filename: str, handler, retry_count: int = 0, embedding: bool = False, embedding_provider: str = "openai"):
         """Implementation of document processing that runs in the background thread.
         This is a non-async version that runs in a background thread.
@@ -992,7 +1092,7 @@ class RagnorDocumentProcessor:
                 "fileFormat": file_format,
                 "totalPages": total_pages,  # Will be updated if not determined yet
                 "processedPages": [],
-                "pageContents": [],
+                "pageReferences": [],  # Will store references to page content in separate collection
                 "metadata": metadata,
                 "createdAt": datetime.utcnow(),
                 "updatedAt": datetime.utcnow()
@@ -1018,155 +1118,281 @@ class RagnorDocumentProcessor:
             self._update_job_status_sync(
                 job_id, JobStatus.PROCESSING, conversion_progress)
 
-            # Handle PDFs and non-PDFs differently
-            if is_pdf and total_pages > 10:  # If it's a large PDF
-                # Process large PDFs page by page
-                print(
-                    f"Processing large PDF with {total_pages} pages one page at a time")
-
-                # Process pages one by one, starting immediate OCR on each page
-                for page_num in range(1, total_pages + 1):  # 1-indexed page numbers
+            # Use threading for parallel processing but avoid problematic analysis methods
+            print(f"Setting up parallel processing for {total_pages} pages using {NUM_CORES} worker threads")
+            
+            # Process pages in smaller batches to avoid memory issues
+            batch_size = min(NUM_CORES * 2, 50)  # Use at most 50 pages per batch
+            
+            # Create batches of page numbers to process
+            page_batches = []
+            for i in range(0, total_pages, batch_size):
+                end = min(i + batch_size, total_pages)
+                page_batches.append(list(range(i+1, end+1)))  # 1-indexed page numbers
+            
+            print(f"Processing document in {len(page_batches)} batches of up to {batch_size} pages each")
+            
+            # Function to process a single page directly - hybrid approach using both direct text extraction and OCR
+            def process_page_direct(page_num):
+                thread_id = threading.get_ident()
+                print(f"[Thread {thread_id}] Processing page {page_num}/{total_pages}")
+                
+                try:
+                    # Try direct text extraction first (faster)
                     try:
-                        # Check if this is a scanned page or text-based page
-                        is_scanned = PDFHandler.is_page_scanned(file_content, page_num)
-                        
-                        if is_scanned:
-                            # For scanned pages, use the existing OCR process
-                            print(f"Page {page_num} is detected as a scanned page, using OCR")
-                            # Convert just this page to an image
-                            image = PDFHandler.convert_page_to_image(
-                                file_content, page_num, total_pages)
-
-                            # Immediately process this page with OCR and generate embeddings if requested
-                            self._process_single_page_sync(
-                                image, page_num, total_pages, file_format, extraction_id, job_id,
-                                generate_embeddings=embedding, embedding_provider=embedding_provider)
-                        else:
-                            # For text-based pages, use pdfplumber to extract text directly
-                            print(f"Page {page_num} is detected as a text-based page, using pdfplumber")
-                            text = PDFHandler.extract_text_from_page(file_content, page_num)
-                            print(f"Extracted {len(text)} characters directly from text-based PDF")
+                        text = PDFHandler.extract_text_from_page(file_content, page_num)
+                        has_direct_text = len(text.strip()) > 0
+                        print(f"[Thread {thread_id}] Page {page_num} direct extraction: {len(text)} chars")
+                    except Exception as text_err:
+                        print(f"[Thread {thread_id}] Page {page_num} direct extraction failed: {str(text_err)}")
+                        text = ""
+                        has_direct_text = False
+                    
+                    # If direct extraction failed or returned little text, try OCR
+                    ocr_text = ""
+                    text_chunks = []
+                    extraction_method = "pdfplumber"
+                    
+                    if not has_direct_text or len(text) < 100:  # If no text or very little text
+                        try:
+                            print(f"[Thread {thread_id}] Using OCR for page {page_num}")
+                            # Convert page to image for OCR
+                            image = PDFHandler.convert_page_to_image(file_content, page_num, total_pages)
                             
-                            # Process the text directly without OCR
-                            self._process_text_page(
-                                text, page_num, total_pages, file_format, extraction_id, job_id,
-                                generate_embeddings=embedding, embedding_provider=embedding_provider)
-                        
-                        processed_pages.append(page_num)
-
-                        # Update progress - scale from 10% to 90% based on page completion
-                        progress = 10.0 + \
-                            (80.0 * len(processed_pages) / total_pages)
-                        self._update_job_status_sync(
-                            job_id, JobStatus.PROCESSING, progress)
-
-                    except Exception as page_err:
-                        print(
-                            f"Error processing page {page_num}: {str(page_err)}")
-                        # Continue with other pages even if one fails
-                        continue
-            else:
-                if is_pdf:
-                    # For small PDFs, check each page to determine if it's scanned or text-based
-                    print(f"Processing small PDF with {total_pages} pages")
+                            # Perform OCR
+                            ocr_result = text_extractor.extract_text(image, doc_format=file_format)
+                            ocr_text = "\n".join([line.text for line in ocr_result.text_lines]) if ocr_result.text_lines else ""
+                            
+                            # Create text chunks from OCR
+                            if ocr_result.text_lines:
+                                for line in ocr_result.text_lines:
+                                    text_chunks.append({
+                                        "text": line.text,
+                                        "confidence": line.confidence,
+                                        "position": {
+                                            "x": line.bbox[0] if line.bbox else 0,
+                                            "y": line.bbox[1] if line.bbox else 0,
+                                            "width": line.bbox[2] if line.bbox else 0,
+                                            "height": line.bbox[3] if line.bbox else 0
+                                        }
+                                    })
+                            
+                            # If OCR found more text, use it instead
+                            if len(ocr_text) > len(text):
+                                print(f"[Thread {thread_id}] Using OCR text for page {page_num} ({len(ocr_text)} chars)")
+                                text = ocr_text
+                                extraction_method = "tesseract_ocr"
+                            else:
+                                print(f"[Thread {thread_id}] Keeping direct text for page {page_num} ({len(text)} chars)")
+                        except Exception as ocr_err:
+                            print(f"[Thread {thread_id}] OCR failed for page {page_num}: {str(ocr_err)}")
                     
-                    # Get converted images for OCR if needed, but we might not use all of them
-                    converted_images = handler.convert_to_images(file_content, file_format)
+                    # If we don't have text chunks yet, create them from direct text
+                    if not text_chunks and text:
+                        lines = text.split('\n')
+                        for i, line in enumerate(lines):
+                            if line.strip():
+                                text_chunks.append({
+                                    "text": line,
+                                    "confidence": 100.0,
+                                    "position": {
+                                        "x": 0,
+                                        "y": i * 20,
+                                        "width": 1000,
+                                        "height": 20
+                                    }
+                                })
+                    # Generate embeddings if requested
+                    embeddings = []
+                    embedding_model = ""
+                    has_embeddings = False
                     
-                    # If we didn't know the total pages before, update it now
-                    if total_pages == 0 and converted_images:
-                        total_pages = len(converted_images)
-                        print(f"Updated total page count to {total_pages} based on converted images")
-                        # Update the extraction document with the correct total page count
+                    if embedding and text.strip():
                         try:
+                            print(f"[Thread {thread_id}] Generating embeddings for page {page_num}")
+                            
+                            # Try to use the existing embedding generator directly
+                            # (self refers to RagnorDocumentProcessor instance)
+                            if hasattr(self, 'embedding_generator') and self.embedding_generator:
+                                print(f"[Thread {thread_id}] Using existing embedding generator for page {page_num}")
+                                embedding_generator = self.embedding_generator
+                                embeddings = embedding_generator.generate_embeddings(text)
+                                embedding_model = embedding_generator.model
+                                has_embeddings = bool(embeddings)
+                            else:
+                                # Fallback to creating a new generator with the specified provider
+                                # This follows the implementation mentioned in the memory about handling embedding providers
+                                from utils.ragnor_embedding_generator import get_embedding_generator
+                                print(f"[Thread {thread_id}] Creating new {embedding_provider} embedding generator for page {page_num}")
+                                try:
+                                    # First try with the specified provider directly
+                                    generator = get_embedding_generator(embedding_provider)
+                                    embeddings = generator.generate_embeddings(text)
+                                    embedding_model = generator.model
+                                    has_embeddings = bool(embeddings)
+                                except ValueError as e:
+                                    # Only fall back if the provider is truly unsupported
+                                    print(f"[Thread {thread_id}] Error with {embedding_provider} provider: {str(e)}")
+                                    # Re-raise the error instead of falling back
+                                    raise
+                            
+                            if has_embeddings:
+                                print(f"[Thread {thread_id}] Generated embeddings for page {page_num}")
+                            else:
+                                print(f"[Thread {thread_id}] Failed to generate embeddings for page {page_num}")
+                        except Exception as emb_err:
+                            print(f"[Thread {thread_id}] Error generating embeddings: {str(emb_err)}")
+                    
+                    # Create the page data structure
+                    page_data = {
+                        "pageNumber": page_num,
+                        "text": text,
+                        "embeddings": embeddings,
+                        "embeddingModel": embedding_model,
+                        "hasEmbeddings": has_embeddings,
+                        "textChunks": text_chunks,
+                        "hasTable": False,
+                        "tables": [],
+                        "extractionMethod": extraction_method
+                    }
+                    
+                    # Update the database with the extracted data
+                    try:
+                        # First remove any existing page data
+                        ragnor_doc_extractions_collection.update_one(
+                            {"_id": extraction_id},
+                            {"$pull": {"pageContents": {"pageNumber": page_num}}}
+                        )
+                        
+                        # Mark this page as processed
+                        ragnor_doc_extractions_collection.update_one(
+                            {"_id": extraction_id},
+                            {"$addToSet": {"processedPages": page_num}}
+                        )
+                        
+                        # Store page content in a separate collection to avoid MongoDB 16MB document limit
+                        
+                        # Create a unique ID for this page content (combine extraction ID and page number)
+                        page_content_id = f"{extraction_id}_{page_num}"
+                        
+                        # Prepare page data for separate collection
+                        page_content_doc = {
+                            "_id": page_content_id,
+                            "extractionId": extraction_id,
+                            "pageNumber": page_num,
+                            "text": text,
+                            "embeddings": embeddings,
+                            "embeddingModel": embedding_model,
+                            "hasEmbeddings": has_embeddings,
+                            "textChunks": text_chunks,
+                            "hasTable": False,
+                            "tables": [],
+                            "extractionMethod": extraction_method,
+                            "createdAt": datetime.utcnow()
+                        }
+                        
+                        # Store complete page content in separate collection
+                        try:
+                            # Insert or update the page content document
+                            ragnor_page_contents_collection.replace_one(
+                                {"_id": page_content_id},
+                                page_content_doc,
+                                upsert=True
+                            )
+                            
+                            # Only store a reference in the main extraction document
+                            page_reference = {
+                                "pageNumber": page_num,
+                                "contentId": page_content_id,
+                                "hasEmbeddings": has_embeddings,
+                                "extractionMethod": extraction_method
+                            }
+                            
+                            # Update the main extraction document with just the reference
                             ragnor_doc_extractions_collection.update_one(
                                 {"_id": extraction_id},
-                                {"$set": {"totalPages": total_pages}}
+                                {
+                                    "$pull": {"pageReferences": {"pageNumber": page_num}}
+                                }
                             )
-                        except Exception as update_err:
-                            print(f"Error updating total page count: {str(update_err)}")
-                    
-                    # Update progress now that we have the images
-                    self._update_job_status_sync(job_id, JobStatus.PROCESSING, 15.0)
-                    
-                    # Process each page
-                    print(f"Starting text extraction on {total_pages} pages...")
-                    
-                    for page_num in range(1, total_pages + 1):
-                        # Check if this is a scanned page or text-based page
-                        is_scanned = PDFHandler.is_page_scanned(file_content, page_num)
-                        
-                        if is_scanned:
-                            # For scanned pages, use OCR
-                            print(f"Page {page_num} is detected as a scanned page, using OCR")
-                            # Get the image for this page (0-indexed in the list)
-                            image = converted_images[page_num - 1]
-                            # Process with OCR
-                            self._process_single_page_sync(
-                                image, page_num, total_pages, file_format, extraction_id, job_id,
-                                generate_embeddings=embedding, embedding_provider=embedding_provider)
-                        else:
-                            # For text-based pages, use pdfplumber
-                            print(f"Page {page_num} is detected as a text-based page, using pdfplumber")
-                            text = PDFHandler.extract_text_from_page(file_content, page_num)
-                            print(f"Extracted {len(text)} characters directly from text-based PDF")
-                            # Process the text directly
-                            self._process_text_page(
-                                text, page_num, total_pages, file_format, extraction_id, job_id,
-                                generate_embeddings=embedding, embedding_provider=embedding_provider)
-                        
-                        processed_pages.append(page_num)
-                        
-                        # Update progress - scale from 15% to 85% based on page completion
-                        progress = 15.0 + (70.0 * len(processed_pages) / total_pages)
-                        print(f"Page {page_num} complete. Progress: {progress:.1f}%")
-                        self._update_job_status_sync(job_id, JobStatus.PROCESSING, progress)
-                else:
-                    # For non-PDFs, use the standard approach with image conversion and OCR
-                    converted_images = handler.convert_to_images(
-                        file_content, file_format)
-
-                    # If we didn't know the total pages before, update it now
-                    if total_pages == 0 and converted_images:
-                        total_pages = len(converted_images)
-                        print(
-                            f"Updated total page count to {total_pages} based on converted images")
-                        # Update the extraction document with the correct total page count
-                        try:
+                            
                             ragnor_doc_extractions_collection.update_one(
                                 {"_id": extraction_id},
-                                {"$set": {"totalPages": total_pages}}
+                                {
+                                    "$addToSet": {"pageReferences": page_reference},
+                                    "$set": {"updatedAt": datetime.utcnow()}
+                                }
                             )
-                        except Exception as update_err:
-                            print(
-                                f"Error updating total page count: {str(update_err)}")
+                            
+                            print(f"[Thread {thread_id}] Page {page_num} content stored in separate collection")
+                            
+                        except Exception as db_err:
+                            print(f"[Thread {thread_id}] Database error storing page {page_num} content: {str(db_err)}")
+                            raise
+                        print(f"[Thread {thread_id}] Database updated for page {page_num}")
+                        return {
+                            'page_num': page_num,
+                            'success': True,
+                            'error': None
+                        }
+                    except Exception as db_err:
+                        print(f"[Thread {thread_id}] Database error for page {page_num}: {str(db_err)}")
+                        return {
+                            'page_num': page_num,
+                            'success': False,
+                            'error': f"Database error: {str(db_err)}"
+                        }
+                except Exception as e:
+                    print(f"[Thread {thread_id}] Processing error for page {page_num}: {str(e)}")
+                    traceback.print_exc()
+                    return {
+                        'page_num': page_num,
+                        'success': False,
+                        'error': str(e)
+                    }
+            
+            # Initialize tracking variables
+            processed_pages = []
+            progress_count = 0
+            
+            # Update progress to show we're starting processing
+            self._update_job_status_sync(job_id, JobStatus.PROCESSING, 15.0)
+            
+            # Process each batch of pages
+            for batch_idx, page_batch in enumerate(page_batches):
+                print(f"Processing batch {batch_idx+1}/{len(page_batches)} with {len(page_batch)} pages")
+                
+                # Use ThreadPoolExecutor for parallel processing of each batch
+                with ThreadPoolExecutor(max_workers=NUM_CORES) as executor:
+                    # Submit tasks for each page in this batch
+                    futures = {executor.submit(process_page_direct, page_num): page_num for page_num in page_batch}
+                    
+                    # Process results as they complete
+                    for future in as_completed(futures):
+                        page_num = futures[future]
+                        try:
+                            # Get the result from the completed future
+                            result = future.result()
+                            progress_count += 1
+                            
+                            # Track successfully processed pages
+                            if result['success']:
+                                processed_pages.append(result['page_num'])
+                            else:
+                                print(f"Warning: Page {result['page_num']} failed: {result['error']}")
+                            
+                            # Update progress (scale from 15% to 85%)
+                            progress = 15.0 + (70.0 * progress_count / total_pages)
+                            print(f"Completed page {result['page_num']}/{total_pages}. Progress: {progress:.1f}%")
+                            self._update_job_status_sync(job_id, JobStatus.PROCESSING, progress)
+                            
+                        except Exception as exc:
+                            print(f"ERROR processing page {page_num}: {exc}")
+                            traceback.print_exc()
+                            
+            # Print summary after all batches are processed
+            print(f"Finished processing all pages. Total pages: {total_pages}, Processed pages: {len(processed_pages)}")
 
-                    # Update progress now that we have the images
-                    self._update_job_status_sync(
-                        job_id, JobStatus.PROCESSING, 15.0)
-
-                    # Process each image and extract text
-                    print(
-                        f"Starting OCR text extraction on {total_pages} pages...")
-
-                    for idx, image in enumerate(converted_images):
-                        page_num = idx + 1
-                        # Process this page with OCR
-                        self._process_single_page_sync(
-                            image, page_num, total_pages, file_format, extraction_id, job_id,
-                            generate_embeddings=embedding, embedding_provider=embedding_provider)
-                        processed_pages.append(page_num)
-
-                        # Update progress - scale from 15% to 85% based on page completion
-                        progress = 15.0 + (70.0 * (idx + 1) / total_pages)
-                        print(
-                            f"Page {page_num} complete. Progress: {progress:.1f}%")
-                        self._update_job_status_sync(
-                            job_id, JobStatus.PROCESSING, progress)
-
-            # Verify that we've processed all pages as expected
-            print(
-                f"Finished processing all pages. Total pages: {total_pages}, Processed pages: {len(processed_pages)}")
 
             # If some pages failed processing but we have at least one successful page, we can still consider the job successful
             if len(processed_pages) < total_pages:
@@ -1542,20 +1768,21 @@ class RagnorDocumentProcessor:
             # Debug extraction document
             print(f"Found extraction document: ID={extraction_doc.get('_id')}")
             print(f"Total pages: {extraction_doc.get('totalPages')}")
-            print(
-                f"Processed pages: {len(extraction_doc.get('pageContents', []))}")
-            print(
-                f"Document has text content: {bool(extraction_doc.get('pageContents'))}")
-
+            
+            # Look for page references (new structure) or page contents (old structure)
+            page_references = extraction_doc.get('pageReferences', [])
+            page_contents = extraction_doc.get('pageContents', [])
+            
+            print(f"Found {len(page_references)} page references and {len(page_contents)} direct page contents")
+            
             # Verify extraction document structure
-            if not extraction_doc.get('pageContents'):
-                print(f"WARNING: Extraction document has no page contents")
+            if not page_references and not page_contents:
+                print(f"WARNING: Extraction document has no page data (neither references nor contents)")
                 # Try to print more info about the document
                 print(f"Document keys: {list(extraction_doc.keys())}")
                 print(f"Document jobId: {extraction_doc.get('jobId')}")
                 if extraction_doc.get('jobId') != job_id:
-                    print(
-                        f"ERROR: jobId mismatch: {extraction_doc.get('jobId')} != {job_id}")
+                    print(f"ERROR: jobId mismatch: {extraction_doc.get('jobId')} != {job_id}")
 
                 # This might be a corrupt document, create an empty result
                 return {
@@ -1585,31 +1812,90 @@ class RagnorDocumentProcessor:
                 "pages": []
             }
 
-            # Add page contents
-            for page_content in extraction_doc.get("pageContents", []):
-                # Include embeddings if they exist in the document
-                has_embeddings = page_content.get("hasEmbeddings", False)
+            # Add page contents from either the references (new model) or direct contents (old model)
+            if page_references:
+                print(f"Using new page reference model for {len(page_references)} pages")
+                # New model: Pages are stored in a separate collection referenced by contentId
+                for page_ref in sorted(page_references, key=lambda p: p.get("pageNumber", 0)):
+                    page_num = page_ref.get("pageNumber")
+                    content_id = page_ref.get("contentId")
+                    
+                    print(f"Fetching page content for page {page_num} with content ID: {content_id}")
+                    
+                    # Fetch the full page content from the separate collection
+                    try:
+                        page_content_doc = ragnor_page_contents_collection.find_one({"_id": content_id})
+                        
+                        if page_content_doc:
+                            # Include embeddings if they exist in the document
+                            has_embeddings = page_content_doc.get("hasEmbeddings", False)
+                            
+                            # Create page data for response
+                            page = {
+                                "pageNumber": page_content_doc.get("pageNumber"),
+                                "text": page_content_doc.get("text"),
+                                "hasEmbeddings": has_embeddings,
+                                "extractionMethod": page_content_doc.get("extractionMethod", "ocr"),
+                                # Only include relevant chunked fields to reduce size
+                                # "textChunks": page_content_doc.get("textChunks", []),
+                                # "hasTable": page_content_doc.get("hasTable", False),
+                                # "tables": page_content_doc.get("tables", [])
+                            }
+                            
+                            # Add embeddings and model if they exist
+                            if has_embeddings:
+                                # Include embeddings and model information
+                                page["embeddings"] = page_content_doc.get("embeddings", [])
+                                page["embeddingModel"] = page_content_doc.get("embeddingModel", "")
+                                print(f"Including embeddings for page {page_num} in API response")
+                            
+                            response["pages"].append(page)
+                        else:
+                            print(f"WARNING: Could not find page content document with ID: {content_id}")
+                            # Include a placeholder for missing pages
+                            response["pages"].append({
+                                "pageNumber": page_num,
+                                "text": "[Content not found]",
+                                "hasEmbeddings": False,
+                                "extractionMethod": "unknown",
+                                "error": f"Content not found for page {page_num}"
+                            })
+                    except Exception as e:
+                        print(f"ERROR fetching page content for page {page_num}: {str(e)}")
+                        # Include error in response
+                        response["pages"].append({
+                            "pageNumber": page_num,
+                            "text": f"[Error retrieving content: {str(e)}]",
+                            "hasEmbeddings": False,
+                            "extractionMethod": "unknown",
+                            "error": str(e)
+                        })
+            
+            elif page_contents:
+                print(f"Using legacy direct page content model for {len(page_contents)} pages")
+                # Legacy model: Pages are stored directly in the extraction document
+                for page_content in sorted(page_contents, key=lambda p: p.get("pageNumber", 0)):
+                    # Include embeddings if they exist in the document
+                    has_embeddings = page_content.get("hasEmbeddings", False)
 
-                page = {
-                    "pageNumber": page_content.get("pageNumber"),
-                    "text": page_content.get("text"),
-                    "hasEmbeddings": has_embeddings,
-                    "extractionMethod": page_content.get("extractionMethod", "ocr"),  # Include extraction method
-                    # "textChunks": page_content.get("textChunks", []),  # Temporarily commented out
-                    # "hasTable": page_content.get("hasTable", False),
-                    # "tables": page_content.get("tables", [])
-                }
+                    page = {
+                        "pageNumber": page_content.get("pageNumber"),
+                        "text": page_content.get("text"),
+                        "hasEmbeddings": has_embeddings,
+                        "extractionMethod": page_content.get("extractionMethod", "ocr"),
+                        # "textChunks": page_content.get("textChunks", []),  # Temporarily commented out
+                        # "hasTable": page_content.get("hasTable", False),
+                        # "tables": page_content.get("tables", [])
+                    }
 
-                # Add embeddings and model if they exist
-                if has_embeddings:
-                    # Include embeddings and model information
-                    page["embeddings"] = page_content.get("embeddings", [])
-                    page["embeddingModel"] = page_content.get(
-                        "embeddingModel", "")
-                    print(
-                        f"Including embeddings for page {page_content.get('pageNumber')} in API response")
+                    # Add embeddings and model if they exist
+                    if has_embeddings:
+                        # Include embeddings and model information
+                        page["embeddings"] = page_content.get("embeddings", [])
+                        page["embeddingModel"] = page_content.get("embeddingModel", "")
+                        print(f"Including embeddings for page {page_content.get('pageNumber')} in API response")
 
-                response["pages"].append(page)
+                    response["pages"].append(page)
 
             return response
 
